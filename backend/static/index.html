@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Agentic Cars</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- ======= VIDEO LAYER ======= -->
+  <video id="camera-video" autoplay playsinline muted></video>
+
+  <!-- ======= CONNECTION SCREEN (shown when not connected) ======= -->
+  <div id="connect-screen" class="overlay center-content">
+    <div class="connect-box">
+      <h1>🚗 Agentic Cars</h1>
+      <p class="subtitle">Remote Control</p>
+      <div class="form-group">
+        <label for="backend-url">Backend Server URL</label>
+        <input id="backend-url" type="text" placeholder="ws://192.168.1.100:3000" />
+      </div>
+      <button id="btn-connect" class="btn btn-red">Connect</button>
+    </div>
+  </div>
+
+  <!-- ======= WAITING SCREEN ======= -->
+  <div id="waiting-screen" class="overlay center-content hidden">
+    <p class="waiting-text">Waiting for Pi to come online…</p>
+  </div>
+
+  <!-- ======= HUD OVERLAY ======= -->
+  <div id="hud" class="overlay hud hidden">
+
+    <!-- Top Bar -->
+    <div class="top-bar">
+      <div class="top-left">
+        <span class="logo">Agentic Cars</span>
+        <span id="latency" class="badge hidden">--ms</span>
+      </div>
+      <div class="top-right">
+        <span id="cam-status" class="status-dot dot-off" title="Camera"></span>
+        <span id="pi-status" class="status-dot dot-off" title="Pi Agent"></span>
+        <span id="battery-display" class="badge hidden">🔋 --%</span>
+        <span id="car-name" class="badge hidden"></span>
+        <button id="btn-connect-car" class="btn btn-sm btn-green hidden">Connect Car</button>
+        <button id="btn-disconnect-car" class="btn btn-sm btn-outline hidden">Disconnect Car</button>
+        <span id="scanning-label" class="badge hidden">Scanning…</span>
+        <button id="btn-disconnect-backend" class="btn btn-sm btn-outline">Disconnect</button>
+      </div>
+    </div>
+
+    <!-- Error Banner -->
+    <div id="error-banner" class="error-banner hidden"></div>
+
+    <!-- Bottom HUD -->
+    <div class="bottom-hud">
+      <!-- WASD keys -->
+      <div class="wasd-group">
+        <div class="wasd-row">
+          <div class="key" id="key-w" data-key="w">W</div>
+        </div>
+        <div class="wasd-row">
+          <div class="key" id="key-a" data-key="a">A</div>
+          <div class="key" id="key-s" data-key="s">S</div>
+          <div class="key" id="key-d" data-key="d">D</div>
+        </div>
+      </div>
+
+      <!-- Hints (hidden on mobile) -->
+      <div class="hints">
+        <p>WASD drive · L lights · T turbo · O donut</p>
+      </div>
+
+      <!-- Toggle buttons -->
+      <div class="toggle-group">
+        <button class="toggle-btn" id="btn-lights" data-active="false">
+          <span class="toggle-label">💡 Lights</span>
+          <span class="toggle-hotkey">L</span>
+          <span class="toggle-dot"></span>
+        </button>
+        <button class="toggle-btn" id="btn-turbo" data-active="false">
+          <span class="toggle-label">🚀 Turbo</span>
+          <span class="toggle-hotkey">T</span>
+          <span class="toggle-dot"></span>
+        </button>
+        <button class="toggle-btn" id="btn-donut" data-active="false">
+          <span class="toggle-label">🍩 Donut</span>
+          <span class="toggle-hotkey">O</span>
+          <span class="toggle-dot"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

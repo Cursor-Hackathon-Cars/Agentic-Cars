@@ -1,0 +1,302 @@
+/* ===== Reset & Base ===== */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: #000;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color: #fff;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ===== Video ===== */
+#camera-video {
+  position: fixed; inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  transform: rotate(180deg);
+  z-index: 0;
+  background: #000;
+}
+
+/* ===== Overlays ===== */
+.overlay {
+  position: fixed; inset: 0;
+  z-index: 10;
+}
+
+.center-content {
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.85);
+}
+
+.hidden { display: none !important; }
+
+/* ===== Connection Screen ===== */
+.connect-box {
+  background: rgba(30, 30, 30, 0.95);
+  border: 1px solid #333;
+  border-radius: 16px;
+  padding: 40px 36px;
+  max-width: 400px;
+  width: 90%;
+  text-align: center;
+}
+
+.connect-box h1 {
+  font-size: 28px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.subtitle {
+  color: #888;
+  font-size: 14px;
+  margin-bottom: 28px;
+}
+
+.form-group {
+  text-align: left;
+  margin-bottom: 20px;
+}
+
+.form-group label {
+  display: block;
+  font-size: 13px;
+  color: #aaa;
+  margin-bottom: 6px;
+}
+
+.form-group input {
+  width: 100%;
+  padding: 10px 14px;
+  font-size: 15px;
+  border-radius: 8px;
+  border: 1px solid #444;
+  background: #1a1a1a;
+  color: #fff;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.form-group input:focus {
+  border-color: #ef4444;
+}
+
+/* ===== Buttons ===== */
+.btn {
+  padding: 10px 24px;
+  font-size: 15px;
+  font-weight: 600;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.btn:active { transform: scale(0.96); }
+
+.btn-red { background: #ef4444; color: #fff; }
+.btn-red:hover { background: #dc2626; }
+
+.btn-green { background: #22c55e; color: #fff; }
+.btn-green:hover { background: #16a34a; }
+
+.btn-sm { padding: 6px 14px; font-size: 12px; }
+
+.btn-outline {
+  background: transparent;
+  border: 1px solid #555;
+  color: #ccc;
+}
+.btn-outline:hover { border-color: #888; color: #fff; }
+
+/* ===== Waiting Screen ===== */
+.waiting-text {
+  font-size: 20px;
+  color: #888;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
+/* ===== HUD ===== */
+.hud {
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  z-index: 20;
+}
+
+.hud button, .hud input { pointer-events: auto; }
+
+/* --- Top Bar --- */
+.top-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  background: linear-gradient(180deg, rgba(0,0,0,0.7) 0%, transparent 100%);
+}
+
+.top-left, .top-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+
+.badge {
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  background: rgba(255,255,255,0.1);
+  white-space: nowrap;
+}
+
+/* --- Status Dots --- */
+.status-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.dot-off { background: #555; }
+.dot-on  { background: #22c55e; box-shadow: 0 0 6px #22c55e; animation: glow 2s infinite; }
+.dot-warn { background: #f59e0b; box-shadow: 0 0 6px #f59e0b; animation: glow 2s infinite; }
+
+@keyframes glow {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* --- Error Banner --- */
+.error-banner {
+  margin: 0 20px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  background: rgba(239, 68, 68, 0.2);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #fca5a5;
+  font-size: 13px;
+  pointer-events: auto;
+}
+
+/* --- Bottom HUD --- */
+.bottom-hud {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  padding: 20px 24px;
+  background: linear-gradient(0deg, rgba(0,0,0,0.7) 0%, transparent 100%);
+}
+
+/* WASD Keys */
+.wasd-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.wasd-row {
+  display: flex;
+  gap: 4px;
+}
+
+.key {
+  width: 52px; height: 52px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 10px;
+  border: 1px solid #444;
+  background: rgba(255,255,255,0.06);
+  font-size: 16px;
+  font-weight: 700;
+  transition: all 0.1s;
+}
+
+.key.active {
+  background: rgba(239, 68, 68, 0.3);
+  border-color: #ef4444;
+  color: #ef4444;
+  box-shadow: 0 0 12px rgba(239, 68, 68, 0.3);
+  transform: scale(0.95);
+}
+
+/* Hints */
+.hints {
+  color: #555;
+  font-size: 12px;
+  text-align: center;
+}
+
+@media (max-width: 640px) {
+  .hints { display: none; }
+}
+
+/* Toggle Buttons */
+.toggle-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  pointer-events: auto;
+}
+
+.toggle-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  min-width: 150px;
+  border-radius: 10px;
+  border: 1px solid #444;
+  background: rgba(255,255,255,0.06);
+  color: #ccc;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.toggle-btn:hover { border-color: #666; }
+
+.toggle-btn[data-active="true"] {
+  border-color: currentColor;
+  background: rgba(255,255,255,0.1);
+}
+
+#btn-lights[data-active="true"] { color: #f59e0b; border-color: #f59e0b; background: rgba(245,158,11,0.15); }
+#btn-turbo[data-active="true"]  { color: #ef4444; border-color: #ef4444; background: rgba(239,68,68,0.15); }
+#btn-donut[data-active="true"]  { color: #a855f7; border-color: #a855f7; background: rgba(168,85,247,0.15); }
+
+.toggle-label { flex: 1; text-align: left; }
+
+.toggle-hotkey {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(255,255,255,0.08);
+  color: #888;
+}
+
+.toggle-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: #444;
+  transition: all 0.15s;
+}
+
+.toggle-btn[data-active="true"] .toggle-dot {
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+}

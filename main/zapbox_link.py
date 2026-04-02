@@ -1,38 +1,20 @@
 """
-Zapbox Link Interface — reads controller input from a Zapbox headset
-and translates it into car control signals.
+Zapbox Controller Server — serves the controller UI and accepts
+WebSocket connections from the phone browser (Zapbox browser, Safari,
+Chrome, etc.).
 
-The Zapbox Link exposes a WebSocket endpoint that streams 6DOF
-controller state at high frequency.  This module connects to that
-stream, maps tilt / rotation to driving controls, and tracks whether
-the user is actively holding the controller.
+Runs a small aiohttp web server on ZAPBOX_PORT that:
+    GET  /    → serves controller.html (the phone opens this URL)
+    WS   /ws  → receives controller_state JSON at ~20 Hz
 
-When the controller goes idle (no significant movement for
-INACTIVITY_SEC seconds) the Copilot switches to autonomous mode and
-hands the car to the AI DrivingAgent.
+When running in the Zapbox browser the page uses WebXR to read the
+6DOF controllers.  In any other browser it falls back to the
+DeviceOrientation gyroscope API.
 
 Environment variables:
-    ZAPBOX_LINK_URL     ws://host:port     (Zapbox Link endpoint)
+    ZAPBOX_PORT         8080               port for HTTP + WebSocket
     INACTIVITY_SEC      3.0                seconds before agent takes over
     TILT_THRESHOLD      15.0               degrees of tilt for input
-
-Expected Zapbox Link message format (JSON over WebSocket):
-    {
-        "type": "controller_state",
-        "rotation": { "pitch": float, "yaw": float, "roll": float },
-        "position": { "x": float, "y": float, "z": float },
-        "buttons":  { "trigger": bool, "grip": bool, "a": bool, "b": bool },
-        "timestamp": int
-    }
-
-Driving mapping:
-    pitch  > +threshold   →  forward
-    pitch  < −threshold   →  reverse
-    roll   > +threshold   →  right
-    roll   < −threshold   →  left
-    button A (toggle)     →  lights
-    button B (toggle)     →  turbo
-    trigger (held)        →  donut
 """
 
 import asyncio
@@ -41,14 +23,15 @@ import logging
 import os
 import time
 
-import websockets
+from aiohttp import web
 
 log = logging.getLogger("zapbox")
 
-ZAPBOX_LINK_URL = os.getenv("ZAPBOX_LINK_URL", "")
+ZAPBOX_PORT = int(os.getenv("ZAPBOX_PORT", "8080"))
 INACTIVITY_SEC = float(os.getenv("INACTIVITY_SEC", "3.0"))
 TILT_THRESHOLD = float(os.getenv("TILT_THRESHOLD", "15.0"))
-RECONNECT_DELAY = 3
+
+CONTROLLER_HTML = os.path.join(os.path.dirname(__file__), "controller.html")
 
 ZERO = dict(
     forward=0, reverse=0, left=0, right=0,
@@ -58,14 +41,14 @@ ZERO = dict(
 
 class ZapboxLink:
     """
-    Maintains a persistent WebSocket connection to the Zapbox Link
-    endpoint and converts 6DOF controller state into the car's
-    control format (forward/reverse/left/right/lights/turbo/donut).
+    Serves the controller page over HTTP and accepts a single WebSocket
+    connection that streams gyroscope / XR controller data.
     """
 
     def __init__(self):
         self.connected = False
         self.running = True
+        self.port = ZAPBOX_PORT
         self._control: dict = dict(ZERO)
         self._last_movement: float = 0.0
         self._prev_pitch: float | None = None
@@ -76,7 +59,6 @@ class ZapboxLink:
         self._btn_b_prev = False
 
     def is_active(self) -> bool:
-        """True when the Zapbox is connected AND the user moved recently."""
         if not self.connected:
             return False
         return (time.time() - self._last_movement) < INACTIVITY_SEC
@@ -119,7 +101,6 @@ class ZapboxLink:
             donut=1 if trigger else 0,
         )
 
-        # Movement detection for inactivity tracking
         if self._prev_pitch is not None and self._prev_roll is not None:
             delta_pitch = abs(pitch - self._prev_pitch)
             delta_roll = abs(roll - self._prev_roll)
@@ -131,32 +112,65 @@ class ZapboxLink:
         self._prev_pitch = pitch
         self._prev_roll = roll
 
-    # ---- websocket loop ----
+    def _reset(self):
+        self._control = dict(ZERO)
+        self._prev_pitch = None
+        self._prev_roll = None
+        self._lights_on = False
+        self._turbo_on = False
+        self._btn_a_prev = False
+        self._btn_b_prev = False
+
+    # ---- HTTP handler ----
+
+    async def _handle_index(self, _request: web.Request) -> web.Response:
+        return web.FileResponse(CONTROLLER_HTML)
+
+    # ---- WebSocket handler ----
+
+    async def _handle_ws(self, request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        remote = request.remote or "unknown"
+        log.info("Controller connected from %s", remote)
+        self.connected = True
+        self._reset()
+        self._last_movement = time.time()
+
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                    except json.JSONDecodeError:
+                        continue
+                    if data.get("type") == "controller_state":
+                        self._process(data)
+                elif msg.type == web.WSMsgType.ERROR:
+                    break
+        finally:
+            self.connected = False
+            self._reset()
+            log.info("Controller disconnected from %s", remote)
+
+        return ws
+
+    # ---- main ----
 
     async def run(self):
-        if not ZAPBOX_LINK_URL:
-            log.info("ZAPBOX_LINK_URL not set — Zapbox disabled, agent-only mode")
+        app = web.Application()
+        app.router.add_get("/", self._handle_index)
+        app.router.add_get("/ws", self._handle_ws)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", self.port)
+        await site.start()
+        log.info("Zapbox server listening on 0.0.0.0:%d", self.port)
+
+        try:
             while self.running:
-                await asyncio.sleep(1)
-            return
-
-        log.info("Zapbox Link connecting to %s", ZAPBOX_LINK_URL)
-
-        while self.running:
-            try:
-                async with websockets.connect(ZAPBOX_LINK_URL) as ws:
-                    self.connected = True
-                    self._last_movement = time.time()
-                    log.info("Zapbox Link connected")
-                    async for raw in ws:
-                        msg = json.loads(raw)
-                        if msg.get("type") == "controller_state":
-                            self._process(msg)
-            except (websockets.ConnectionClosed, OSError) as e:
-                log.warning("Zapbox connection lost: %s", e)
-            finally:
-                self.connected = False
-                self._control = dict(ZERO)
-
-            if self.running:
-                await asyncio.sleep(RECONNECT_DELAY)
+                await asyncio.sleep(0.5)
+        finally:
+            await runner.cleanup()

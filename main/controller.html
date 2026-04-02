@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Zapbox Controller</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: #111;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color: #fff;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 16px;
+  gap: 12px;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.title { font-size: 18px; font-weight: 700; }
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: #888;
+}
+
+.dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: #555;
+}
+
+.dot.on {
+  background: #22c55e;
+  box-shadow: 0 0 8px #22c55e;
+}
+
+.mode-badge {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  background: rgba(255,255,255,0.08);
+  color: #888;
+}
+
+.mode-badge.xr { background: rgba(168,85,247,0.2); color: #c084fc; }
+.mode-badge.gyro { background: rgba(245,158,11,0.2); color: #fbbf24; }
+
+.tilt-display {
+  background: rgba(255,255,255,0.05);
+  border: 1px solid #333;
+  border-radius: 12px;
+  padding: 16px;
+  display: flex;
+  justify-content: space-around;
+  text-align: center;
+}
+
+.tilt-val {
+  font-size: 28px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.tilt-label {
+  font-size: 11px;
+  color: #666;
+  margin-top: 4px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.direction {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.direction-ring {
+  width: 180px; height: 180px;
+  border: 2px solid #333;
+  border-radius: 50%;
+  position: relative;
+}
+
+.direction-dot {
+  width: 24px; height: 24px;
+  background: #ef4444;
+  border-radius: 50%;
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 16px rgba(239, 68, 68, 0.5);
+  transition: all 0.05s linear;
+}
+
+.direction-labels { position: absolute; inset: 0; pointer-events: none; }
+
+.dir-label {
+  position: absolute;
+  font-size: 11px;
+  color: #555;
+  font-weight: 600;
+}
+
+.dir-label.fwd { top: -20px; left: 50%; transform: translateX(-50%); }
+.dir-label.rev { bottom: -20px; left: 50%; transform: translateX(-50%); }
+.dir-label.lt  { left: -30px; top: 50%; transform: translateY(-50%); }
+.dir-label.rt  { right: -30px; top: 50%; transform: translateY(-50%); }
+
+.actions { display: flex; gap: 10px; }
+
+.action-btn {
+  flex: 1;
+  padding: 18px 8px;
+  border-radius: 12px;
+  border: 1px solid #444;
+  background: rgba(255,255,255,0.06);
+  color: #ccc;
+  font-size: 15px;
+  font-weight: 600;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.1s;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.action-btn.active-lights {
+  color: #f59e0b; border-color: #f59e0b;
+  background: rgba(245, 158, 11, 0.15);
+}
+
+.action-btn.active-turbo {
+  color: #ef4444; border-color: #ef4444;
+  background: rgba(239, 68, 68, 0.15);
+}
+
+.action-btn.active-donut {
+  color: #a855f7; border-color: #a855f7;
+  background: rgba(168, 85, 247, 0.15);
+}
+
+.action-btn .btn-icon { font-size: 22px; display: block; margin-bottom: 4px; }
+
+.xr-prompt {
+  background: rgba(168,85,247,0.1);
+  border: 1px solid rgba(168,85,247,0.3);
+  border-radius: 12px;
+  padding: 14px;
+  text-align: center;
+}
+
+.xr-prompt button {
+  margin-top: 10px;
+  padding: 12px 28px;
+  font-size: 15px;
+  font-weight: 700;
+  border: none;
+  border-radius: 10px;
+  background: #a855f7;
+  color: #fff;
+  cursor: pointer;
+}
+
+.xr-prompt button:active { transform: scale(0.97); }
+
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<div class="app">
+  <div class="header">
+    <span class="title">Zapbox Controller</span>
+    <div class="status">
+      <span id="mode-badge" class="mode-badge">--</span>
+      <span id="status-text">Connecting...</span>
+      <span class="dot" id="status-dot"></span>
+    </div>
+  </div>
+
+  <!-- WebXR start prompt (shown only when WebXR is available) -->
+  <div id="xr-prompt" class="xr-prompt hidden">
+    <div>Zapbox controllers detected</div>
+    <button id="btn-start-xr">Start XR Session</button>
+  </div>
+
+  <div class="tilt-display">
+    <div>
+      <div class="tilt-val" id="pitch-val">0</div>
+      <div class="tilt-label">Pitch</div>
+    </div>
+    <div>
+      <div class="tilt-val" id="roll-val">0</div>
+      <div class="tilt-label">Roll</div>
+    </div>
+  </div>
+
+  <div class="direction">
+    <div class="direction-ring">
+      <div class="direction-dot" id="dir-dot"></div>
+      <div class="direction-labels">
+        <span class="dir-label fwd">FWD</span>
+        <span class="dir-label rev">REV</span>
+        <span class="dir-label lt">L</span>
+        <span class="dir-label rt">R</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button class="action-btn" id="btn-lights">
+      <span class="btn-icon">💡</span> Lights
+    </button>
+    <button class="action-btn" id="btn-turbo">
+      <span class="btn-icon">🚀</span> Turbo
+    </button>
+    <button class="action-btn" id="btn-donut">
+      <span class="btn-icon">🍩</span> Donut
+    </button>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var SEND_HZ = 20;
+
+  var pitchEl   = document.getElementById("pitch-val");
+  var rollEl    = document.getElementById("roll-val");
+  var dirDot    = document.getElementById("dir-dot");
+  var statusText = document.getElementById("status-text");
+  var statusDot  = document.getElementById("status-dot");
+  var modeBadge  = document.getElementById("mode-badge");
+  var xrPrompt   = document.getElementById("xr-prompt");
+  var btnStartXR = document.getElementById("btn-start-xr");
+  var btnLights  = document.getElementById("btn-lights");
+  var btnTurbo   = document.getElementById("btn-turbo");
+  var btnDonut   = document.getElementById("btn-donut");
+
+  var ws = null;
+  var sendTimer = null;
+  var reconnectTimer = null;
+  var inputMode = "none";
+
+  var pitch = 0;
+  var roll = 0;
+  var basePitch = null;
+  var baseRoll = null;
+
+  var buttons = { trigger: false, a: false, b: false };
+
+  // ---- WebSocket (auto-connect to same host) ----
+  var wsUrl = "ws://" + location.host + "/ws";
+
+  function connectWS() {
+    if (ws) { ws.close(); ws = null; }
+    clearTimeout(reconnectTimer);
+    setStatus("connecting");
+
+    ws = new WebSocket(wsUrl);
+    ws.onopen = function () {
+      setStatus("connected");
+      startSending();
+    };
+    ws.onclose = function () {
+      setStatus("disconnected");
+      stopSending();
+      reconnectTimer = setTimeout(connectWS, 2000);
+    };
+    ws.onerror = function () {};
+  }
+
+  function setStatus(s) {
+    if (s === "connected") {
+      statusText.textContent = "Connected";
+      statusDot.className = "dot on";
+    } else if (s === "connecting") {
+      statusText.textContent = "Connecting...";
+      statusDot.className = "dot";
+    } else {
+      statusText.textContent = "Reconnecting...";
+      statusDot.className = "dot";
+    }
+  }
+
+  function startSending() {
+    stopSending();
+    sendTimer = setInterval(function () {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({
+        type: "controller_state",
+        rotation: { pitch: pitch, yaw: 0, roll: roll },
+        buttons: { trigger: buttons.trigger, a: buttons.a, b: buttons.b },
+      }));
+    }, 1000 / SEND_HZ);
+  }
+
+  function stopSending() {
+    if (sendTimer) { clearInterval(sendTimer); sendTimer = null; }
+  }
+
+  // ---- UI update ----
+  function updateVisuals() {
+    pitchEl.textContent = Math.round(pitch);
+    rollEl.textContent  = Math.round(roll);
+
+    var ringSize = 180;
+    var maxOff = (ringSize / 2) - 12;
+    var dx = Math.max(-maxOff, Math.min(maxOff, (roll / 45) * maxOff));
+    var dy = Math.max(-maxOff, Math.min(maxOff, -(pitch / 45) * maxOff));
+    dirDot.style.transform = "translate(calc(-50% + " + dx + "px), calc(-50% + " + dy + "px))";
+  }
+
+  // ================================================================
+  //  INPUT MODE 1: WebXR (Zapbox browser with 6DOF controllers)
+  // ================================================================
+  var xrSession = null;
+  var xrRefSpace = null;
+
+  function checkWebXR() {
+    if (!navigator.xr) return;
+    navigator.xr.isSessionSupported("immersive-ar").then(function (ok) {
+      if (!ok) {
+        navigator.xr.isSessionSupported("immersive-vr").then(function (ok2) {
+          if (ok2) showXRPrompt("immersive-vr");
+        });
+      } else {
+        showXRPrompt("immersive-ar");
+      }
+    });
+  }
+
+  function showXRPrompt(sessionType) {
+    xrPrompt.classList.remove("hidden");
+    btnStartXR.onclick = function () { startXR(sessionType); };
+  }
+
+  function startXR(sessionType) {
+    navigator.xr.requestSession(sessionType, {
+      optionalFeatures: ["local-floor", "hand-tracking"],
+    }).then(function (session) {
+      xrSession = session;
+      inputMode = "webxr";
+      modeBadge.textContent = "WebXR";
+      modeBadge.className = "mode-badge xr";
+      xrPrompt.classList.add("hidden");
+
+      session.requestReferenceSpace("local-floor").then(function (refSpace) {
+        xrRefSpace = refSpace;
+        session.requestAnimationFrame(onXRFrame);
+      }).catch(function () {
+        session.requestReferenceSpace("local").then(function (refSpace) {
+          xrRefSpace = refSpace;
+          session.requestAnimationFrame(onXRFrame);
+        });
+      });
+
+      session.addEventListener("end", function () {
+        xrSession = null;
+        xrRefSpace = null;
+        inputMode = "none";
+        startGyroFallback();
+      });
+    }).catch(function (err) {
+      console.warn("WebXR session failed:", err);
+      startGyroFallback();
+    });
+  }
+
+  function onXRFrame(time, frame) {
+    if (!xrSession) return;
+    xrSession.requestAnimationFrame(onXRFrame);
+
+    var sources = frame.session.inputSources;
+    for (var i = 0; i < sources.length; i++) {
+      var src = sources[i];
+      var space = src.gripSpace || src.targetRaySpace;
+      if (!space) continue;
+
+      var pose = frame.getPose(space, xrRefSpace);
+      if (pose) {
+        var q = pose.transform.orientation;
+        // quaternion → pitch (around X) and roll (around Z)
+        var sinP = 2.0 * (q.w * q.x - q.y * q.z);
+        sinP = Math.max(-1, Math.min(1, sinP));
+        pitch = Math.asin(sinP) * (180 / Math.PI);
+
+        var sinR = 2.0 * (q.w * q.z + q.x * q.y);
+        var cosR = 1.0 - 2.0 * (q.x * q.x + q.z * q.z);
+        roll = Math.atan2(sinR, cosR) * (180 / Math.PI);
+
+        updateVisuals();
+      }
+
+      if (src.gamepad) {
+        var gp = src.gamepad;
+        buttons.trigger = gp.buttons.length > 0 && gp.buttons[0].pressed;
+        buttons.a = gp.buttons.length > 4 && gp.buttons[4].pressed;
+        buttons.b = gp.buttons.length > 5 && gp.buttons[5].pressed;
+      }
+
+      break; // use first controller only
+    }
+  }
+
+  // ================================================================
+  //  INPUT MODE 2: DeviceOrientation (phone gyroscope fallback)
+  // ================================================================
+
+  function startGyroFallback() {
+    if (inputMode === "webxr") return;
+    inputMode = "gyro";
+    modeBadge.textContent = "Gyro";
+    modeBadge.className = "mode-badge gyro";
+
+    if (typeof DeviceOrientationEvent !== "undefined" &&
+        typeof DeviceOrientationEvent.requestPermission === "function") {
+      DeviceOrientationEvent.requestPermission()
+        .then(function (state) {
+          if (state === "granted") attachGyro();
+          else alert("Gyroscope permission denied.");
+        })
+        .catch(function () { attachGyro(); });
+    } else {
+      attachGyro();
+    }
+  }
+
+  function attachGyro() {
+    window.addEventListener("deviceorientation", function (e) {
+      var rawPitch = e.beta  || 0;
+      var rawRoll  = e.gamma || 0;
+
+      if (basePitch === null) {
+        basePitch = rawPitch;
+        baseRoll = rawRoll;
+      }
+
+      pitch = Math.max(-90, Math.min(90, rawPitch - basePitch));
+      roll  = Math.max(-90, Math.min(90, rawRoll  - baseRoll));
+      updateVisuals();
+    });
+  }
+
+  // ---- Action buttons ----
+  btnLights.addEventListener("click", function () {
+    buttons.a = true;
+    btnLights.classList.toggle("active-lights");
+    setTimeout(function () { buttons.a = false; }, 100);
+  });
+
+  btnTurbo.addEventListener("click", function () {
+    buttons.b = true;
+    btnTurbo.classList.toggle("active-turbo");
+    setTimeout(function () { buttons.b = false; }, 100);
+  });
+
+  btnDonut.addEventListener("touchstart", function (e) {
+    e.preventDefault();
+    buttons.trigger = true;
+    btnDonut.classList.add("active-donut");
+  }, { passive: false });
+  btnDonut.addEventListener("touchend", function (e) {
+    e.preventDefault();
+    buttons.trigger = false;
+    btnDonut.classList.remove("active-donut");
+  }, { passive: false });
+  btnDonut.addEventListener("mousedown", function (e) {
+    e.preventDefault();
+    buttons.trigger = true;
+    btnDonut.classList.add("active-donut");
+  });
+  btnDonut.addEventListener("mouseup", function (e) {
+    e.preventDefault();
+    buttons.trigger = false;
+    btnDonut.classList.remove("active-donut");
+  });
+
+  // ---- Recalibrate gyro on double-tap ----
+  var lastTap = 0;
+  document.addEventListener("touchend", function () {
+    var now = Date.now();
+    if (now - lastTap < 300) {
+      basePitch = null;
+      baseRoll = null;
+    }
+    lastTap = now;
+  });
+
+  // ---- Boot ----
+  connectWS();
+  checkWebXR();
+
+  // If WebXR isn't available after a short delay, fall back to gyro
+  setTimeout(function () {
+    if (inputMode === "none") startGyroFallback();
+  }, 1500);
+
+})();
+</script>
+</body>
+</html>

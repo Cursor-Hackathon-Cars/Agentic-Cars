@@ -37,6 +37,7 @@ import asyncio
 import logging
 import os
 import signal
+import socket
 
 import aiohttp
 
@@ -190,9 +191,26 @@ class Copilot:
 
     # ---- entry ----
 
+    @staticmethod
+    def _local_ip() -> str:
+        """Best-effort detection of the machine's LAN IP."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+
     async def run(self):
+        local_ip = self._local_ip()
         log.info("Agentic Copilot starting")
         log.info("  BACKEND_URL = %s", BACKEND_URL)
+        log.info(
+            "  Controller → open controller.html on your phone and enter: %s:%d",
+            local_ip, self.zapbox.port,
+        )
 
         self.http = aiohttp.ClientSession()
         try:

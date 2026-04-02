@@ -8,52 +8,57 @@
 </head>
 <body>
   <!-- ======= VIDEO LAYER ======= -->
-  <video id="camera-video" autoplay playsinline muted></video>
+  <img id="camera-feed" class="hidden" alt="Camera" />
 
-  <!-- ======= CONNECTION SCREEN (shown when not connected) ======= -->
-  <div id="connect-screen" class="overlay center-content">
-    <div class="connect-box">
-      <h1>🚗 Agentic Cars</h1>
-      <p class="subtitle">Remote Control</p>
-      <div class="form-group">
-        <label for="backend-url">Backend Server URL</label>
-        <input id="backend-url" type="text" placeholder="ws://192.168.1.100:3000" />
-      </div>
-      <button id="btn-connect" class="btn btn-red">Connect</button>
-    </div>
-  </div>
-
-  <!-- ======= WAITING SCREEN ======= -->
-  <div id="waiting-screen" class="overlay center-content hidden">
-    <p class="waiting-text">Waiting for Pi to come online…</p>
-  </div>
-
-  <!-- ======= HUD OVERLAY ======= -->
-  <div id="hud" class="overlay hud hidden">
+  <!-- ======= MAIN UI ======= -->
+  <div id="main-ui" class="overlay">
 
     <!-- Top Bar -->
     <div class="top-bar">
       <div class="top-left">
-        <span class="logo">Agentic Cars</span>
-        <span id="latency" class="badge hidden">--ms</span>
+        <span class="logo">🚗 Agentic Cars</span>
       </div>
       <div class="top-right">
         <span id="cam-status" class="status-dot dot-off" title="Camera"></span>
-        <span id="pi-status" class="status-dot dot-off" title="Pi Agent"></span>
+        <span class="status-label">Cam</span>
+        <span id="car-status-dot" class="status-dot dot-off" title="Car"></span>
+        <span class="status-label">Car</span>
         <span id="battery-display" class="badge hidden">🔋 --%</span>
         <span id="car-name" class="badge hidden"></span>
-        <button id="btn-connect-car" class="btn btn-sm btn-green hidden">Connect Car</button>
-        <button id="btn-disconnect-car" class="btn btn-sm btn-outline hidden">Disconnect Car</button>
-        <span id="scanning-label" class="badge hidden">Scanning…</span>
-        <button id="btn-disconnect-backend" class="btn btn-sm btn-outline">Disconnect</button>
       </div>
     </div>
 
     <!-- Error Banner -->
     <div id="error-banner" class="error-banner hidden"></div>
 
-    <!-- Bottom HUD -->
-    <div class="bottom-hud">
+    <!-- Center Content -->
+    <div class="center-panel">
+
+      <!-- Car Section -->
+      <div class="panel-section">
+        <h2>Car Control</h2>
+        <div class="btn-row">
+          <button id="btn-scan" class="btn btn-green">Scan for Cars</button>
+        </div>
+        <div id="scan-results" class="scan-results hidden"></div>
+        <div id="car-connected-info" class="car-info hidden">
+          <span id="connected-car-name"></span>
+          <button id="btn-disconnect-car" class="btn btn-sm btn-outline">Disconnect</button>
+        </div>
+      </div>
+
+      <!-- Camera Section -->
+      <div class="panel-section">
+        <h2>Camera</h2>
+        <div class="btn-row">
+          <button id="btn-camera-connect" class="btn btn-green">Connect Camera</button>
+          <button id="btn-camera-disconnect" class="btn btn-sm btn-outline hidden">Stop Camera</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bottom HUD (only visible when car connected) -->
+    <div id="drive-hud" class="bottom-hud hidden">
       <!-- WASD keys -->
       <div class="wasd-group">
         <div class="wasd-row">
@@ -66,7 +71,7 @@
         </div>
       </div>
 
-      <!-- Hints (hidden on mobile) -->
+      <!-- Hints -->
       <div class="hints">
         <p>WASD drive · L lights · T turbo · O donut</p>
       </div>

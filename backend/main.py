@@ -1,95 +1,81 @@
 import os
-import json
-import uuid
+import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+import httpx
+from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
-from starlette.websockets import WebSocketState
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel
+from bleak import BleakScanner, BleakClient
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 PORT = int(os.environ.get("PORT", "3000"))
-PI_TOKEN = os.environ.get("PI_TOKEN", "changeme")
-
-PI_MESSAGE_TYPES = {"car/status", "camera/answer", "camera/candidate"}
-
-# ---------------------------------------------------------------------------
-# Global state
-# ---------------------------------------------------------------------------
-pi_socket: WebSocket | None = None
-clients: dict[str, WebSocket] = {}  # client_id -> WebSocket
+PI_IP = os.environ.get("PI_IP", "172.20.10.2")
+GO2RTC_PORT = int(os.environ.get("GO2RTC_PORT", "1984"))
+GO2RTC_BASE = f"http://{PI_IP}:{GO2RTC_PORT}"
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-async def broadcast(msg: dict) -> None:
-    """Send a JSON message to every connected browser client."""
-    data = json.dumps(msg)
-    stale: list[str] = []
-    for cid, ws in clients.items():
-        try:
-            if ws.client_state == WebSocketState.CONNECTED:
-                await ws.send_text(data)
-        except Exception:
-            stale.append(cid)
-    for cid in stale:
-        clients.pop(cid, None)
-
-
-async def send_to_pi(msg: dict) -> bool:
-    """Send a JSON message to the Pi. Returns False if Pi is offline."""
-    global pi_socket
-    if pi_socket is None:
-        return False
-    try:
-        await pi_socket.send_text(json.dumps(msg))
-        return True
-    except Exception:
-        pi_socket = None
-        return False
-
-
-async def send_to_client(client_id: str, msg: dict) -> None:
-    """Send a JSON message to a specific browser client."""
-    ws = clients.get(client_id)
-    if ws is None:
-        return
-    try:
-        if ws.client_state == WebSocketState.CONNECTED:
-            await ws.send_text(json.dumps(msg))
-    except Exception:
-        clients.pop(client_id, None)
-
-
-def sanitise_control(msg: dict) -> dict:
-    """Coerce all control fields to 0 or 1."""
-    return {
-        "type": "control",
-        "forward": 1 if msg.get("forward") else 0,
-        "reverse": 1 if msg.get("reverse") else 0,
-        "left": 1 if msg.get("left") else 0,
-        "right": 1 if msg.get("right") else 0,
-        "lights": 1 if msg.get("lights") else 0,
-        "turbo": 1 if msg.get("turbo") else 0,
-        "donut": 1 if msg.get("donut") else 0,
-    }
+# BLE UUIDs (Shell Racing Legends)
+CONTROL_CHAR_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"
+BATTERY_CHAR_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
 
 
 # ---------------------------------------------------------------------------
-# Lifespan
+# Car state (one car at a time)
+# ---------------------------------------------------------------------------
+class CarState:
+    def __init__(self):
+        self.ble_client: BleakClient | None = None
+        self.connected: bool = False
+        self.name: str = ""
+        self.battery: int | None = None
+        self.scanning: bool = False
+        self.scanned_devices: list[dict] = []  # [{name, address}, ...]
+        self.control = bytearray([1, 0, 0, 0, 0, 0, 0, 0])
+
+
+car = CarState()
+
+
+# ---------------------------------------------------------------------------
+# 20 Hz BLE control loop
+# ---------------------------------------------------------------------------
+async def control_loop():
+    """Continuously writes the current control state to the car at 20 Hz."""
+    while True:
+        if car.connected and car.ble_client and car.ble_client.is_connected:
+            try:
+                await car.ble_client.write_gatt_char(
+                    CONTROL_CHAR_UUID, bytes(car.control), response=False
+                )
+            except Exception:
+                car.connected = False
+                car.ble_client = None
+                car.name = ""
+                car.battery = None
+                car.control = bytearray([1, 0, 0, 0, 0, 0, 0, 0])
+        await asyncio.sleep(1.0 / 20)  # 50 ms
+
+
+# ---------------------------------------------------------------------------
+# Lifespan — start/stop the background control loop
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if PI_TOKEN == "changeme":
-        print("⚠️  Using default PI_TOKEN — set PI_TOKEN env var for production")
+    task = asyncio.create_task(control_loop())
     print(f"🚗 Backend server listening on port {PORT}")
+    print(f"📷 Pi camera expected at {GO2RTC_BASE}")
     yield
+    task.cancel()
+    if car.ble_client and car.connected:
+        try:
+            await car.ble_client.disconnect()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -99,153 +85,213 @@ app = FastAPI(lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
-# HTTP routes
+# Health
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return JSONResponse({"ok": True})
+    return {"ok": True}
 
 
-# ---------------------------------------------------------------------------
-# WebSocket: Pi agent  (/ws/pi?token=...)
-# ---------------------------------------------------------------------------
-@app.websocket("/ws/pi")
-async def ws_pi(websocket: WebSocket, token: str = Query("")):
-    global pi_socket
+# ===========================  CAR ENDPOINTS  ===============================
 
-    # Authenticate
-    if token != PI_TOKEN:
-        await websocket.close(code=4001, reason="Unauthorized")
-        return
 
-    await websocket.accept()
+@app.post("/car/scan")
+async def car_scan():
+    """Scan BLE for Shell Racing cars. Returns up to 3 found devices."""
+    if car.scanning:
+        return JSONResponse({"error": "Already scanning"}, status_code=409)
 
-    # Replace existing Pi connection
-    if pi_socket is not None:
+    car.scanning = True
+    try:
+        devices = await BleakScanner.discover(timeout=10)
+        found = []
+        for d in devices:
+            name = d.name or ""
+            if name.startswith("SL-"):
+                found.append({"name": name, "address": d.address})
+        car.scanned_devices = found[:3]
+        return {
+            "cars": [
+                {"number": i + 1, "name": c["name"], "address": c["address"]}
+                for i, c in enumerate(car.scanned_devices)
+            ]
+        }
+    finally:
+        car.scanning = False
+
+
+@app.post("/car/connect/{car_number}")
+async def car_connect(car_number: int):
+    """Connect to a scanned car by number (1, 2, or 3)."""
+    if car.connected:
+        return JSONResponse(
+            {"error": "Already connected to a car. Disconnect first."},
+            status_code=409,
+        )
+    if car_number < 1 or car_number > len(car.scanned_devices):
+        return JSONResponse(
+            {"error": f"Invalid car number. Scanned {len(car.scanned_devices)} car(s)."},
+            status_code=400,
+        )
+
+    device = car.scanned_devices[car_number - 1]
+    try:
+        client = BleakClient(device["address"])
+        await client.connect()
+
+        # Read battery level
+        battery = None
         try:
-            await pi_socket.close(code=4000, reason="Replaced by new connection")
+            raw = await client.read_gatt_char(BATTERY_CHAR_UUID)
+            battery = raw[0]
         except Exception:
             pass
 
-    pi_socket = websocket
-    print("✅ Pi agent connected")
-    await broadcast({"type": "pi/status", "connected": True})
+        car.ble_client = client
+        car.connected = True
+        car.name = device["name"]
+        car.battery = battery
+        car.control = bytearray([1, 0, 0, 0, 0, 0, 0, 0])
 
+        return {"connected": True, "name": car.name, "battery": car.battery}
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to connect: {e}"}, status_code=500)
+
+
+@app.post("/car/disconnect")
+async def car_disconnect():
+    """Disconnect from the current car."""
+    if not car.connected:
+        return JSONResponse({"error": "No car connected"}, status_code=409)
     try:
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-
-            msg_type = msg.get("type")
-            if msg_type not in PI_MESSAGE_TYPES:
-                continue
-
-            if msg_type == "car/status":
-                await broadcast(msg)
-            elif msg_type in ("camera/answer", "camera/candidate"):
-                client_id = msg.pop("clientId", None)
-                if client_id:
-                    await send_to_client(client_id, msg)
-    except WebSocketDisconnect:
-        pass
+        if car.ble_client:
+            await car.ble_client.disconnect()
     except Exception:
         pass
-    finally:
-        if pi_socket is websocket:
-            pi_socket = None
-        print("❌ Pi agent disconnected")
-        await broadcast({"type": "pi/status", "connected": False})
-        await broadcast({
-            "type": "car/status",
-            "connected": False,
-            "name": "",
-            "battery": None,
-        })
+    car.connected = False
+    car.ble_client = None
+    car.name = ""
+    car.battery = None
+    car.control = bytearray([1, 0, 0, 0, 0, 0, 0, 0])
+    return {"connected": False}
 
 
-# ---------------------------------------------------------------------------
-# WebSocket: Browser clients  (/ws)
-# ---------------------------------------------------------------------------
-@app.websocket("/ws")
-async def ws_client(websocket: WebSocket):
-    await websocket.accept()
+class ControlInput(BaseModel):
+    forward: int = 0
+    reverse: int = 0
+    left: int = 0
+    right: int = 0
+    lights: int = 0
+    turbo: int = 0
+    donut: int = 0
 
-    client_id = str(uuid.uuid4())
-    clients[client_id] = websocket
 
-    # Send current Pi status
-    await send_to_client(client_id, {
-        "type": "pi/status",
-        "connected": pi_socket is not None,
-    })
+@app.post("/car/control")
+async def car_control(inp: ControlInput):
+    """
+    Update the control state. The server continuously sends this state
+    to the car at 20 Hz — no need to poll or repeat from the client.
+    """
+    if not car.connected:
+        return JSONResponse({"error": "No car connected"}, status_code=409)
 
+    car.control[1] = 1 if inp.forward else 0
+    car.control[2] = 1 if inp.reverse else 0
+    car.control[3] = 1 if inp.left else 0
+    car.control[4] = 1 if inp.right else 0
+    car.control[5] = 1 if inp.lights else 0
+    car.control[6] = 1 if inp.turbo else 0
+    car.control[7] = 1 if inp.donut else 0
+
+    return {
+        "ok": True,
+        "control": {
+            "forward": car.control[1],
+            "reverse": car.control[2],
+            "left": car.control[3],
+            "right": car.control[4],
+            "lights": car.control[5],
+            "turbo": car.control[6],
+            "donut": car.control[7],
+        },
+    }
+
+
+@app.get("/car/status")
+async def car_status():
+    """Current car connection state."""
+    return {
+        "connected": car.connected,
+        "name": car.name,
+        "battery": car.battery,
+        "scanning": car.scanning,
+    }
+
+
+# ===========================  CAMERA ENDPOINTS  ===========================
+
+
+@app.post("/camera/connect")
+async def camera_connect():
+    """Check if the Raspberry Pi's go2rtc is reachable."""
     try:
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-
-            msg_type = msg.get("type")
-
-            # --- Pi offline error replies ---
-            if pi_socket is None:
-                error_map = {
-                    "car/connect": "Car not connected — Pi is offline",
-                    "car/disconnect": "Car not connected — Pi is offline",
-                    "control": "Car not connected — Pi is offline",
-                    "camera/offer": "Camera not connected — Pi is offline",
-                    "camera/candidate": "Camera not connected — Pi is offline",
-                }
-                err = error_map.get(msg_type)
-                if err:
-                    await send_to_client(client_id, {
-                        "type": "error",
-                        "message": err,
-                    })
-                continue
-
-            # --- Forward to Pi ---
-            if msg_type == "control":
-                await send_to_pi(sanitise_control(msg))
-
-            elif msg_type in ("car/connect", "car/disconnect"):
-                await send_to_pi({"type": msg_type})
-
-            elif msg_type == "camera/offer":
-                sdp = msg.get("sdp")
-                if isinstance(sdp, str):
-                    await send_to_pi({
-                        "type": "camera/offer",
-                        "sdp": sdp,
-                        "clientId": client_id,
-                    })
-
-            elif msg_type == "camera/candidate":
-                candidate = msg.get("candidate")
-                if isinstance(candidate, str):
-                    await send_to_pi({
-                        "type": "camera/candidate",
-                        "candidate": candidate,
-                        "clientId": client_id,
-                    })
-
-    except WebSocketDisconnect:
-        pass
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(f"{GO2RTC_BASE}/api")
+            resp.raise_for_status()
+        return {"connected": True, "go2rtc_url": GO2RTC_BASE}
     except Exception:
-        pass
-    finally:
-        clients.pop(client_id, None)
-        # Tell Pi to tear down camera session for this client
-        if pi_socket is not None:
-            await send_to_pi({
-                "type": "camera/stop",
-                "clientId": client_id,
-            })
+        return JSONResponse(
+            {"error": f"Pi not reachable at {PI_IP}:{GO2RTC_PORT}"},
+            status_code=503,
+        )
+
+
+@app.get("/camera/stream")
+async def camera_stream():
+    """Proxy the MJPEG stream from go2rtc on the Pi."""
+    url = f"{GO2RTC_BASE}/api/stream.mjpeg?src=camera"
+
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10, read=None, write=None, pool=None)
+    )
+    try:
+        req = client.build_request("GET", url)
+        resp = await client.send(req, stream=True)
+        content_type = resp.headers.get(
+            "content-type", "multipart/x-mixed-replace; boundary=frame"
+        )
+    except Exception:
+        await client.aclose()
+        return JSONResponse(
+            {"error": f"Cannot connect to camera stream at {url}"},
+            status_code=503,
+        )
+
+    async def generate():
+        try:
+            async for chunk in resp.aiter_bytes(chunk_size=4096):
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(generate(), media_type=content_type)
+
+
+@app.get("/camera/snapshot")
+async def camera_snapshot():
+    """Get a single JPEG frame from go2rtc."""
+    url = f"{GO2RTC_BASE}/api/frame.jpeg?src=camera"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return Response(content=resp.content, media_type="image/jpeg")
+    except Exception:
+        return JSONResponse(
+            {"error": f"Cannot get snapshot from {url}"},
+            status_code=503,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +302,6 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.get("/{full_path:path}")
 async def serve_frontend(full_path: str):
-    """Serve index.html for any path (SPA catch-all)."""
     index = os.path.join(STATIC_DIR, "index.html")
     if os.path.isfile(index):
         return FileResponse(index)

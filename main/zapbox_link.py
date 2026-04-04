@@ -11,10 +11,18 @@ When running in the Zapbox browser the page uses WebXR to read the
 6DOF controllers.  In any other browser it falls back to the
 DeviceOrientation gyroscope API.
 
+WebXR mode sends joystick-based input:
+    joystick.forward  — left controller stick Y (−1…1)
+    joystick.steer    — right controller stick X (−1…1)
+    toggles.turbo / toggles.donut / toggles.lights — booleans
+
+Gyro mode falls back to the legacy rotation-based protocol.
+
 Environment variables:
-    ZAPBOX_PORT         8080               port for HTTP + WebSocket
-    INACTIVITY_SEC      3.0                seconds before agent takes over
-    TILT_THRESHOLD      15.0               degrees of tilt for input
+    ZAPBOX_PORT           8080     port for HTTP + WebSocket
+    INACTIVITY_SEC        3.0     seconds before agent takes over
+    TILT_THRESHOLD        15.0    degrees of tilt for gyro input
+    JOYSTICK_THRESHOLD    0.30    deadzone for joystick axes (0–1)
 """
 
 import asyncio
@@ -30,6 +38,7 @@ log = logging.getLogger("zapbox")
 ZAPBOX_PORT = int(os.getenv("ZAPBOX_PORT", "8080"))
 INACTIVITY_SEC = float(os.getenv("INACTIVITY_SEC", "3.0"))
 TILT_THRESHOLD = float(os.getenv("TILT_THRESHOLD", "15.0"))
+JOYSTICK_THRESHOLD = float(os.getenv("JOYSTICK_THRESHOLD", "0.30"))
 
 CONTROLLER_HTML = os.path.join(os.path.dirname(__file__), "controller.html")
 
@@ -51,12 +60,11 @@ class ZapboxLink:
         self.port = ZAPBOX_PORT
         self._control: dict = dict(ZERO)
         self._last_movement: float = 0.0
+        self._msg_count: int = 0
+        self._prev_fwd: float = 0.0
+        self._prev_steer: float = 0.0
         self._prev_pitch: float | None = None
         self._prev_roll: float | None = None
-        self._lights_on = False
-        self._turbo_on = False
-        self._btn_a_prev = False
-        self._btn_b_prev = False
 
     def is_active(self) -> bool:
         if not self.connected:
@@ -69,6 +77,56 @@ class ZapboxLink:
     # ---- input processing ----
 
     def _process(self, msg: dict):
+        if "joystick" in msg:
+            self._process_joystick(msg)
+        else:
+            self._process_gyro(msg)
+
+    def _process_joystick(self, msg: dict):
+        """New protocol: joystick axes + pre-toggled booleans from the client."""
+        joy = msg.get("joystick", {})
+        toggles = msg.get("toggles", {})
+
+        fwd_val = float(joy.get("forward", 0.0))
+        steer_val = float(joy.get("steer", 0.0))
+
+        forward = 1 if fwd_val > JOYSTICK_THRESHOLD else 0
+        reverse = 1 if fwd_val < -JOYSTICK_THRESHOLD else 0
+        right = 1 if steer_val > JOYSTICK_THRESHOLD else 0
+        left = 1 if steer_val < -JOYSTICK_THRESHOLD else 0
+
+        self._control = dict(
+            forward=forward,
+            reverse=reverse,
+            left=left,
+            right=right,
+            lights=1 if toggles.get("lights", False) else 0,
+            turbo=1 if toggles.get("turbo", False) else 0,
+            donut=1 if toggles.get("donut", False) else 0,
+        )
+
+        self._msg_count += 1
+        if self._msg_count % 40 == 1:
+            log.info(
+                "WS recv #%d  fwd_axis=%.2f steer_axis=%.2f → "
+                "fwd=%d rev=%d L=%d R=%d  "
+                "turbo=%s donut=%s lights=%s",
+                self._msg_count, fwd_val, steer_val,
+                forward, reverse, left, right,
+                toggles.get("turbo"), toggles.get("donut"),
+                toggles.get("lights"),
+            )
+
+        delta_fwd = abs(fwd_val - self._prev_fwd)
+        delta_steer = abs(steer_val - self._prev_steer)
+        if delta_fwd > 0.05 or delta_steer > 0.05:
+            self._last_movement = time.time()
+
+        self._prev_fwd = fwd_val
+        self._prev_steer = steer_val
+
+    def _process_gyro(self, msg: dict):
+        """Legacy protocol: pitch/roll rotation + button edge toggles."""
         rot = msg.get("rotation", {})
         buttons = msg.get("buttons", {})
 
@@ -80,26 +138,24 @@ class ZapboxLink:
         right = 1 if roll > TILT_THRESHOLD else 0
         left = 1 if roll < -TILT_THRESHOLD else 0
 
-        btn_a = bool(buttons.get("a", False))
-        btn_b = bool(buttons.get("b", False))
-        trigger = bool(buttons.get("trigger", False))
-
-        if btn_a and not self._btn_a_prev:
-            self._lights_on = not self._lights_on
-        if btn_b and not self._btn_b_prev:
-            self._turbo_on = not self._turbo_on
-        self._btn_a_prev = btn_a
-        self._btn_b_prev = btn_b
-
         self._control = dict(
             forward=forward,
             reverse=reverse,
             left=left,
             right=right,
-            lights=1 if self._lights_on else 0,
-            turbo=1 if self._turbo_on else 0,
-            donut=1 if trigger else 0,
+            lights=1 if buttons.get("lights", False) else 0,
+            turbo=1 if buttons.get("turbo", False) else 0,
+            donut=1 if buttons.get("donut", False) else 0,
         )
+
+        self._msg_count += 1
+        if self._msg_count % 40 == 1:
+            log.info(
+                "WS recv #%d [gyro]  pitch=%.1f roll=%.1f → "
+                "fwd=%d rev=%d L=%d R=%d",
+                self._msg_count, pitch, roll,
+                forward, reverse, left, right,
+            )
 
         if self._prev_pitch is not None and self._prev_roll is not None:
             delta_pitch = abs(pitch - self._prev_pitch)
@@ -114,12 +170,10 @@ class ZapboxLink:
 
     def _reset(self):
         self._control = dict(ZERO)
+        self._prev_fwd = 0.0
+        self._prev_steer = 0.0
         self._prev_pitch = None
         self._prev_roll = None
-        self._lights_on = False
-        self._turbo_on = False
-        self._btn_a_prev = False
-        self._btn_b_prev = False
 
     # ---- HTTP handler ----
 
@@ -144,10 +198,15 @@ class ZapboxLink:
                     try:
                         data = json.loads(msg.data)
                     except json.JSONDecodeError:
+                        log.warning("Malformed JSON from %s: %s", remote, msg.data[:80])
                         continue
-                    if data.get("type") == "controller_state":
+                    msg_type = data.get("type")
+                    if msg_type == "controller_state":
                         self._process(data)
+                    else:
+                        log.debug("Unknown WS message type: %s", msg_type)
                 elif msg.type == web.WSMsgType.ERROR:
+                    log.warning("WS error from %s: %s", remote, ws.exception())
                     break
         finally:
             self.connected = False

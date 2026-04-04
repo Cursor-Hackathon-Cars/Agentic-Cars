@@ -207,11 +207,11 @@ html, body {
   <div class="tilt-display">
     <div>
       <div class="tilt-val" id="pitch-val">0</div>
-      <div class="tilt-label">Pitch</div>
+      <div class="tilt-label">Forward</div>
     </div>
     <div>
       <div class="tilt-val" id="roll-val">0</div>
-      <div class="tilt-label">Roll</div>
+      <div class="tilt-label">Steer</div>
     </div>
   </div>
 
@@ -240,7 +240,12 @@ html, body {
   </div>
 </div>
 
-<script>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from "three";
+
 (function () {
   "use strict";
 
@@ -262,33 +267,65 @@ html, body {
   var sendTimer = null;
   var reconnectTimer = null;
   var inputMode = "none";
+  var wsSendCount = 0;
 
-  var pitch = 0;
-  var roll = 0;
-  var basePitch = null;
-  var baseRoll = null;
+  // Gyro fallback state
+  var pitch = 0, roll = 0;
+  var basePitch = null, baseRoll = null;
 
-  var buttons = { trigger: false, a: false, b: false };
+  // XR joystick state (new protocol)
+  var joyForward = 0;   // left stick Y  (−1…1, positive = forward)
+  var joySteer = 0;     // right stick X (−1…1, positive = right)
 
-  // ---- WebSocket (auto-connect to same host) ----
+  // Toggle states (managed client-side, sent as booleans)
+  var turboOn = false;
+  var donutOn = false;
+  var lightsOn = false;
+
+  // Button edge-detection (right controller)
+  var prevBtnA = false, prevBtnB = false;
+  // Left controller button edge-detection
+  var prevLeftA = false;     // A (index 5) — error screen toggle
+  var prevLeftMenu = false;  // Menu (index 4) — debug log toggle
+  var prevLeftB = false;     // B (index 6) — restart camera pipeline
+  var buttonMapLogged = false;
+
+  // Error screen state (Left A — errors only)
+  var errorScreenVisible = false;
+  var errorLogLines = [];
+
+  // Debug log screen state (Left B — all tagged logs)
+  var debugLogVisible = false;
+  var debugLogLines = [];
+
+  // Screen grab state
+  var grabbing = false;
+  var grabOffset = new THREE.Vector3();
+
+  // ---- WebSocket ----
   var wsUrl = "ws://" + location.host + "/ws";
 
   function connectWS() {
     if (ws) { ws.close(); ws = null; }
     clearTimeout(reconnectTimer);
     setStatus("connecting");
+    console.log("[WS] Connecting to", wsUrl);
 
     ws = new WebSocket(wsUrl);
     ws.onopen = function () {
+      console.log("[WS] Connected");
       setStatus("connected");
       startSending();
     };
-    ws.onclose = function () {
+    ws.onclose = function (ev) {
+      console.warn("[WS] Closed  code=" + ev.code + "  reason=" + ev.reason);
       setStatus("disconnected");
       stopSending();
       reconnectTimer = setTimeout(connectWS, 2000);
     };
-    ws.onerror = function () {};
+    ws.onerror = function (ev) {
+      console.error("[WS] Error", ev);
+    };
   }
 
   function setStatus(s) {
@@ -306,13 +343,29 @@ html, body {
 
   function startSending() {
     stopSending();
+    wsSendCount = 0;
     sendTimer = setInterval(function () {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      ws.send(JSON.stringify({
-        type: "controller_state",
-        rotation: { pitch: pitch, yaw: 0, roll: roll },
-        buttons: { trigger: buttons.trigger, a: buttons.a, b: buttons.b },
-      }));
+
+      var payload;
+      if (inputMode === "webxr") {
+        payload = {
+          type: "controller_state",
+          joystick: { forward: joyForward, steer: joySteer },
+          toggles: { turbo: turboOn, donut: donutOn, lights: lightsOn },
+        };
+      } else {
+        payload = {
+          type: "controller_state",
+          rotation: { pitch: pitch, yaw: 0, roll: roll },
+          buttons: { turbo: turboOn, donut: donutOn, lights: lightsOn },
+        };
+      }
+      ws.send(JSON.stringify(payload));
+      wsSendCount++;
+      if (wsSendCount % 40 === 1) {
+        console.log("[WS] Send #" + wsSendCount, JSON.stringify(payload));
+      }
     }, 1000 / SEND_HZ);
   }
 
@@ -320,30 +373,1349 @@ html, body {
     if (sendTimer) { clearInterval(sendTimer); sendTimer = null; }
   }
 
-  // ---- UI update ----
+  // ---- 2D UI update (non-XR) ----
   function updateVisuals() {
-    pitchEl.textContent = Math.round(pitch);
-    rollEl.textContent  = Math.round(roll);
-
-    var ringSize = 180;
-    var maxOff = (ringSize / 2) - 12;
-    var dx = Math.max(-maxOff, Math.min(maxOff, (roll / 45) * maxOff));
-    var dy = Math.max(-maxOff, Math.min(maxOff, -(pitch / 45) * maxOff));
-    dirDot.style.transform = "translate(calc(-50% + " + dx + "px), calc(-50% + " + dy + "px))";
+    if (inputMode === "webxr") {
+      pitchEl.textContent = joyForward.toFixed(1);
+      rollEl.textContent  = joySteer.toFixed(1);
+      var ringSize = 180, maxOff = (ringSize / 2) - 12;
+      var dx = Math.max(-maxOff, Math.min(maxOff, joySteer * maxOff));
+      var dy = Math.max(-maxOff, Math.min(maxOff, -joyForward * maxOff));
+      dirDot.style.transform = "translate(calc(-50% + " + dx + "px), calc(-50% + " + dy + "px))";
+    } else {
+      pitchEl.textContent = Math.round(pitch);
+      rollEl.textContent  = Math.round(roll);
+      var ringSize2 = 180, maxOff2 = (ringSize2 / 2) - 12;
+      var dx2 = Math.max(-maxOff2, Math.min(maxOff2, (roll / 45) * maxOff2));
+      var dy2 = Math.max(-maxOff2, Math.min(maxOff2, -(pitch / 45) * maxOff2));
+      dirDot.style.transform = "translate(calc(-50% + " + dx2 + "px), calc(-50% + " + dy2 + "px))";
+    }
   }
 
   // ================================================================
-  //  INPUT MODE 1: WebXR (Zapbox browser with 6DOF controllers)
+  //  THREE.JS setup
+  // ================================================================
+  var renderer, scene, camera;
+  var controllerMarkers = {};
+
+  function initThree() {
+    renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    renderer.domElement.style.position = "fixed";
+    renderer.domElement.style.top = "0";
+    renderer.domElement.style.left = "0";
+    renderer.domElement.style.zIndex = "-1";
+    document.body.appendChild(renderer.domElement);
+
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 100);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    var dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(1, 2, 1);
+    scene.add(dirLight);
+  }
+
+  function createControllerMarker(hand) {
+    var group = new THREE.Group();
+    var col = hand === "left" ? 0x22c55e : 0xef4444;
+
+    var sphere = new THREE.Mesh(
+      new THREE.SphereGeometry(0.015, 16, 16),
+      new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 0.5 })
+    );
+    group.add(sphere);
+
+    var rayLen = 0.5;
+    var rayGeo = new THREE.CylinderGeometry(0.003, 0.003, rayLen, 8);
+    rayGeo.rotateX(-Math.PI / 2);
+    rayGeo.translate(0, 0, -rayLen / 2);
+    group.add(new THREE.Mesh(rayGeo, new THREE.MeshStandardMaterial({
+      color: col, emissive: col, emissiveIntensity: 0.4, transparent: true, opacity: 0.7,
+    })));
+
+    var tip = new THREE.Mesh(
+      new THREE.SphereGeometry(0.008, 12, 12),
+      new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.8 })
+    );
+    tip.position.set(0, 0, -rayLen);
+    group.add(tip);
+
+    scene.add(group);
+    return group;
+  }
+
+  function getOrCreateMarker(hand) {
+    if (!controllerMarkers[hand]) {
+      controllerMarkers[hand] = createControllerMarker(hand);
+      console.log("[3D] Created marker for", hand, "controller");
+    }
+    return controllerMarkers[hand];
+  }
+
+  // ================================================================
+  //  3D HUD — canvas texture panel floating near right controller
+  // ================================================================
+  var HUD_W = 256, HUD_H = 192;
+  var hudCanvas, hudCtx, hudTexture, hudMesh;
+
+  function createHud() {
+    hudCanvas = document.createElement("canvas");
+    hudCanvas.width = HUD_W;
+    hudCanvas.height = HUD_H;
+    hudCtx = hudCanvas.getContext("2d");
+
+    hudTexture = new THREE.CanvasTexture(hudCanvas);
+    hudTexture.minFilter = THREE.LinearFilter;
+
+    var mat = new THREE.MeshBasicMaterial({
+      map: hudTexture, transparent: true, depthTest: false,
+    });
+    var geo = new THREE.PlaneGeometry(0.14, 0.105);
+    hudMesh = new THREE.Mesh(geo, mat);
+    hudMesh.renderOrder = 9999;
+    hudMesh.visible = false;
+    scene.add(hudMesh);
+
+    drawHud();
+  }
+
+  function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+  }
+
+  function drawHud() {
+    if (!hudCtx) return;
+    var ctx = hudCtx;
+    ctx.clearRect(0, 0, HUD_W, HUD_H);
+
+    // Background
+    ctx.fillStyle = "rgba(0,0,0,0.65)";
+    roundRect(ctx, 0, 0, HUD_W, HUD_H, 14);
+    ctx.fill();
+
+    var items = [
+      { label: "TURBO",  on: turboOn,  color: "#3b82f6", btnLabel: "R-A" },
+      { label: "DONUT",  on: donutOn,  color: "#f97316", btnLabel: "R-B" },
+    ];
+
+    var rowH = 52;
+    var startY = 14;
+
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var y = startY + i * rowH;
+
+      // Row background when active
+      if (it.on) {
+        ctx.fillStyle = it.color + "33";
+        roundRect(ctx, 10, y, HUD_W - 20, 44, 8);
+        ctx.fill();
+      }
+
+      // Indicator circle
+      ctx.beginPath();
+      ctx.arc(36, y + 22, 12, 0, Math.PI * 2);
+      ctx.fillStyle = it.on ? it.color : "#444";
+      ctx.fill();
+      if (it.on) {
+        ctx.shadowColor = it.color;
+        ctx.shadowBlur = 10;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+
+      // Label
+      ctx.fillStyle = it.on ? "#fff" : "#888";
+      ctx.font = "bold 18px sans-serif";
+      ctx.textBaseline = "middle";
+      ctx.fillText(it.label, 58, y + 22);
+
+      // ON/OFF badge
+      ctx.font = "bold 13px sans-serif";
+      ctx.textAlign = "right";
+      ctx.fillStyle = it.on ? it.color : "#555";
+      ctx.fillText(it.on ? "ON" : "OFF", HUD_W - 18, y + 15);
+
+      // Button hint
+      ctx.font = "11px sans-serif";
+      ctx.fillStyle = "#666";
+      ctx.fillText("[" + it.btnLabel + "]", HUD_W - 18, y + 33);
+      ctx.textAlign = "left";
+    }
+
+    hudTexture.needsUpdate = true;
+  }
+
+  function positionHud(frame, sources) {
+    if (!hudMesh) return;
+    var xrCam = renderer.xr.getCamera();
+
+    for (var i = 0; i < sources.length; i++) {
+      var src = sources[i];
+      if (src.handedness !== "right") continue;
+      var space = src.gripSpace || src.targetRaySpace;
+      if (!space) continue;
+      var pose = frame.getPose(space, xrRefSpace);
+      if (!pose) continue;
+
+      var t = pose.transform.position;
+      var q = pose.transform.orientation;
+      var quat = new THREE.Quaternion(q.x, q.y, q.z, q.w);
+      var offset = new THREE.Vector3(0.08, 0.12, -0.08).applyQuaternion(quat);
+      hudMesh.position.set(t.x + offset.x, t.y + offset.y, t.z + offset.z);
+      hudMesh.lookAt(xrCam.position);
+      hudMesh.visible = true;
+      return;
+    }
+    hudMesh.visible = false;
+  }
+
+  // ================================================================
+  //  Error screen (Left A) — only errors & exceptions
+  // ================================================================
+  var ERR_W = 512, ERR_H = 400;
+  var errCanvas, errCtx, errTexture, errMesh;
+  var ERR_MAX_LINES = 24;
+
+  function createErrorScreen() {
+    errCanvas = document.createElement("canvas");
+    errCanvas.width = ERR_W;
+    errCanvas.height = ERR_H;
+    errCtx = errCanvas.getContext("2d");
+
+    errTexture = new THREE.CanvasTexture(errCanvas);
+    errTexture.minFilter = THREE.LinearFilter;
+
+    var mat = new THREE.MeshBasicMaterial({
+      map: errTexture, transparent: true, depthTest: false, side: THREE.DoubleSide,
+    });
+    var geo = new THREE.PlaneGeometry(0.40, 0.32);
+    errMesh = new THREE.Mesh(geo, mat);
+    errMesh.renderOrder = 9998;
+    errMesh.visible = false;
+    scene.add(errMesh);
+
+    drawErrorScreen();
+  }
+
+  function pushErrorLine(msg) {
+    var ts = new Date().toLocaleTimeString("en-GB", {hour12:false, hour:"2-digit", minute:"2-digit", second:"2-digit"});
+    errorLogLines.push(ts + " " + msg);
+    if (errorLogLines.length > ERR_MAX_LINES) errorLogLines.shift();
+    drawErrorScreen();
+  }
+
+  function drawErrorScreen() {
+    if (!errCtx || !errTexture) return;
+    var ctx = errCtx;
+    ctx.clearRect(0, 0, ERR_W, ERR_H);
+
+    ctx.fillStyle = "rgba(40,0,0,0.85)";
+    roundRect(ctx, 0, 0, ERR_W, ERR_H, 10);
+    ctx.fill();
+
+    ctx.font = "bold 14px monospace";
+    ctx.fillStyle = "#ef4444";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText("ERRORS  [L-A toggle]  (" + errorLogLines.length + ")", 10, 8);
+
+    ctx.beginPath();
+    ctx.strokeStyle = "#511";
+    ctx.moveTo(8, 28);
+    ctx.lineTo(ERR_W - 8, 28);
+    ctx.stroke();
+
+    ctx.font = "12px monospace";
+    ctx.fillStyle = "#fca5a5";
+    var lineH = 15;
+    var startY = 34;
+
+    for (var i = 0; i < errorLogLines.length; i++) {
+      var y = startY + i * lineH;
+      if (y + lineH > ERR_H - 4) break;
+      var display = errorLogLines[i];
+      if (display.length > 68) display = display.substring(0, 65) + "...";
+      ctx.fillText(display, 10, y);
+    }
+
+    if (errorLogLines.length === 0) {
+      ctx.fillStyle = "#666";
+      ctx.fillText("No errors", 10, startY);
+    }
+
+    errTexture.needsUpdate = true;
+  }
+
+  function positionErrorScreen(frame, sources) {
+    if (!errMesh) return;
+    if (!errorScreenVisible) { errMesh.visible = false; return; }
+
+    var xrCam = renderer.xr.getCamera();
+
+    for (var i = 0; i < sources.length; i++) {
+      var src = sources[i];
+      if (src.handedness !== "left") continue;
+      var space = src.gripSpace || src.targetRaySpace;
+      if (!space) continue;
+      var pose = frame.getPose(space, xrRefSpace);
+      if (!pose) continue;
+
+      var t = pose.transform.position;
+      var q = pose.transform.orientation;
+      var quat = new THREE.Quaternion(q.x, q.y, q.z, q.w);
+      var offset = new THREE.Vector3(-0.08, 0.18, -0.06).applyQuaternion(quat);
+      errMesh.position.set(t.x + offset.x, t.y + offset.y, t.z + offset.z);
+      errMesh.lookAt(xrCam.position);
+      errMesh.visible = true;
+      return;
+    }
+    errMesh.visible = false;
+  }
+
+  // ================================================================
+  //  Debug log screen (Left B) — all tagged logs, warnings, errors
+  // ================================================================
+  var DBG_W = 512, DBG_H = 400;
+  var dbgCanvas, dbgCtx, dbgTexture, dbgMesh;
+  var DBG_MAX_LINES = 24;
+
+  function createDebugScreen() {
+    dbgCanvas = document.createElement("canvas");
+    dbgCanvas.width = DBG_W;
+    dbgCanvas.height = DBG_H;
+    dbgCtx = dbgCanvas.getContext("2d");
+
+    dbgTexture = new THREE.CanvasTexture(dbgCanvas);
+    dbgTexture.minFilter = THREE.LinearFilter;
+
+    var mat = new THREE.MeshBasicMaterial({
+      map: dbgTexture, transparent: true, depthTest: false, side: THREE.DoubleSide,
+    });
+    var geo = new THREE.PlaneGeometry(0.40, 0.32);
+    dbgMesh = new THREE.Mesh(geo, mat);
+    dbgMesh.renderOrder = 9997;
+    dbgMesh.visible = false;
+    scene.add(dbgMesh);
+
+    drawDebugLog();
+  }
+
+  function pushDebugLine(level, msg) {
+    var ts = new Date().toLocaleTimeString("en-GB", {hour12:false, hour:"2-digit", minute:"2-digit", second:"2-digit"});
+    debugLogLines.push({ level: level, text: ts + " " + msg });
+    if (debugLogLines.length > DBG_MAX_LINES) debugLogLines.shift();
+    drawDebugLog();
+  }
+
+  function hookConsoleLogs() {
+    var origError = console.error;
+    var origWarn = console.warn;
+    var origLog = console.log;
+
+    console.error = function() {
+      var args = Array.prototype.slice.call(arguments);
+      origError.apply(console, args);
+      var joined = args.map(String).join(" ");
+      pushErrorLine(joined);
+      pushDebugLine("ERR", joined);
+    };
+    console.warn = function() {
+      var args = Array.prototype.slice.call(arguments);
+      origWarn.apply(console, args);
+      var joined = args.map(String).join(" ");
+      if (joined.indexOf("[SCR]") !== -1) {
+        pushDebugLine("WRN", joined);
+      }
+    };
+    console.log = function() {
+      var args = Array.prototype.slice.call(arguments);
+      origLog.apply(console, args);
+      var joined = args.map(String).join(" ");
+      if (joined.indexOf("[SCR]") !== -1) {
+        pushDebugLine("LOG", joined);
+      }
+    };
+
+    window.addEventListener("error", function(ev) {
+      var msg = ev.message + " @ " + (ev.filename || "?") + ":" + (ev.lineno || "?");
+      pushErrorLine(msg);
+      pushDebugLine("ERR", msg);
+    });
+    window.addEventListener("unhandledrejection", function(ev) {
+      var msg = "Promise: " + String(ev.reason);
+      pushErrorLine(msg);
+      pushDebugLine("ERR", msg);
+    });
+  }
+
+  function drawDebugLog() {
+    if (!dbgCtx || !dbgTexture) return;
+    var ctx = dbgCtx;
+    ctx.clearRect(0, 0, DBG_W, DBG_H);
+
+    ctx.fillStyle = "rgba(0,0,0,0.80)";
+    roundRect(ctx, 0, 0, DBG_W, DBG_H, 10);
+    ctx.fill();
+
+    ctx.font = "bold 14px monospace";
+    ctx.fillStyle = "#10b981";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText("DEBUG LOG  [L-B toggle]", 10, 8);
+
+    ctx.beginPath();
+    ctx.strokeStyle = "#333";
+    ctx.moveTo(8, 28);
+    ctx.lineTo(DBG_W - 8, 28);
+    ctx.stroke();
+
+    ctx.font = "12px monospace";
+    var lineH = 15;
+    var startY = 34;
+
+    for (var i = 0; i < debugLogLines.length; i++) {
+      var line = debugLogLines[i];
+      var y = startY + i * lineH;
+      if (y + lineH > DBG_H - 4) break;
+
+      if (line.level === "ERR") ctx.fillStyle = "#ef4444";
+      else if (line.level === "WRN") ctx.fillStyle = "#f59e0b";
+      else ctx.fillStyle = "#a1a1aa";
+
+      var display = line.text;
+      if (display.length > 68) display = display.substring(0, 65) + "...";
+      ctx.fillText(display, 10, y);
+    }
+
+    if (debugLogLines.length === 0) {
+      ctx.fillStyle = "#666";
+      ctx.fillText("No messages yet", 10, startY);
+    }
+
+    dbgTexture.needsUpdate = true;
+  }
+
+  function positionDebugScreen(frame, sources) {
+    if (!dbgMesh) return;
+    if (!debugLogVisible) { dbgMesh.visible = false; return; }
+
+    var xrCam = renderer.xr.getCamera();
+
+    for (var i = 0; i < sources.length; i++) {
+      var src = sources[i];
+      if (src.handedness !== "left") continue;
+      var space = src.gripSpace || src.targetRaySpace;
+      if (!space) continue;
+      var pose = frame.getPose(space, xrRefSpace);
+      if (!pose) continue;
+
+      var t = pose.transform.position;
+      var q = pose.transform.orientation;
+      var quat = new THREE.Quaternion(q.x, q.y, q.z, q.w);
+      var offset = new THREE.Vector3(-0.08, 0.15, -0.08).applyQuaternion(quat);
+      dbgMesh.position.set(t.x + offset.x, t.y + offset.y, t.z + offset.z);
+      dbgMesh.lookAt(xrCam.position);
+      dbgMesh.visible = true;
+      return;
+    }
+    dbgMesh.visible = false;
+  }
+
+  // ================================================================
+  //  Camera feed screen — streams video onto a floating plane
+  //  Tries direct Pi connection first, then falls back through backend
+  // ================================================================
+  var camScreenMesh, camScreenTexture, camScreenCanvas, camScreenCtx;
+  var camFeedRunning = false;
+  var camScreenPlaced = false;
+  var BACKEND_PORT = 3000;
+  var camBackendUrl = "http://" + location.hostname + ":" + BACKEND_PORT;
+  var camStreamSource = "none";  // "webrtc" | "mse" | "video" | "img" | "snapshot"
+  var camStreamVideo = null;
+  var camStreamImg = null;
+  var camMseWs = null;
+  var camRtcPc = null;
+  var camFrameCount = 0;
+  var camSnapshotFailures = 0;
+  var camUsingDirect = false;    // true when trying direct Pi URLs
+
+  var camPiIp = null;      // set from /camera/info when Pi mode
+  var camPiPort = 1984;    // go2rtc port
+  var camUrls = {
+    video: null,
+    mjpeg: null,
+    snapshot: null,
+  };
+  var camProxyUrls = {
+    video: camBackendUrl + "/camera/stream",
+    mjpeg: camBackendUrl + "/camera/stream.mjpeg",
+    snapshot: camBackendUrl + "/camera/snapshot",
+  };
+
+  function createCameraScreen() {
+    var W = 640, H = 360;
+    camScreenCanvas = document.createElement("canvas");
+    camScreenCanvas.width = W;
+    camScreenCanvas.height = H;
+    camScreenCtx = camScreenCanvas.getContext("2d");
+
+    camScreenCtx.fillStyle = "#111";
+    camScreenCtx.fillRect(0, 0, W, H);
+    camScreenCtx.fillStyle = "#666";
+    camScreenCtx.font = "20px sans-serif";
+    camScreenCtx.textAlign = "center";
+    camScreenCtx.textBaseline = "middle";
+    camScreenCtx.fillText("Connecting camera...", W / 2, H / 2);
+
+    camScreenTexture = new THREE.CanvasTexture(camScreenCanvas);
+    camScreenTexture.minFilter = THREE.LinearFilter;
+
+    var geo = new THREE.PlaneGeometry(1.0, 0.5625);
+    var mat = new THREE.MeshBasicMaterial({
+      map: camScreenTexture,
+      side: THREE.DoubleSide,
+    });
+    camScreenMesh = new THREE.Mesh(geo, mat);
+    camScreenMesh.renderOrder = 100;
+    scene.add(camScreenMesh);
+
+    camFeedRunning = true;
+
+    // Ask the backend where the camera is
+    console.log("[CAM] Fetching camera info from backend...");
+    fetch(camBackendUrl + "/camera/info", { mode: "cors" })
+      .then(function (r) { return r.json(); })
+      .then(function (info) {
+        console.log("[CAM] Camera info:", JSON.stringify(info));
+        if (info.source === "pi" && info.stream_url) {
+          camPiIp = info.pi_ip;
+          camPiPort = info.go2rtc_port || 1984;
+          camUrls.video = info.stream_url;
+          camUrls.mjpeg = null;
+          camUrls.snapshot = info.snapshot_url;
+          camUsingDirect = true;
+          console.log("[CAM] Pi mode — direct to " + info.pi_ip + ":" + camPiPort + " (H.264 source)");
+        } else {
+          camPiIp = null;
+          camUrls = Object.assign({}, camProxyUrls);
+          camUsingDirect = false;
+          console.log("[CAM] Laptop mode — streaming via backend proxy");
+        }
+        tryWebRtcStream();
+      })
+      .catch(function (err) {
+        console.warn("[CAM] /camera/info failed, using backend proxy:", err);
+        camPiIp = null;
+        camUrls = Object.assign({}, camProxyUrls);
+        camUsingDirect = false;
+        tryWebRtcStream();
+      });
+  }
+
+  function drawCamPlaceholder(text, color) {
+    if (!camScreenCtx || !camScreenTexture) return;
+    var W = camScreenCanvas.width, H = camScreenCanvas.height;
+    camScreenCtx.fillStyle = "#111";
+    camScreenCtx.fillRect(0, 0, W, H);
+    camScreenCtx.fillStyle = color;
+    camScreenCtx.font = "20px sans-serif";
+    camScreenCtx.textAlign = "center";
+    camScreenCtx.textBaseline = "middle";
+    camScreenCtx.fillText(text, W / 2, H / 2);
+    camScreenTexture.needsUpdate = true;
+  }
+
+  function drawModeLabel() {
+    if (!camScreenCtx || !camScreenTexture) return;
+    var label = camStreamSource.toUpperCase();
+    var bg = "#222";
+    if (camStreamSource === "webrtc") bg = "#0369a1";
+    else if (camStreamSource === "mse") bg = "#0e4f16";
+    else if (camStreamSource === "video") bg = "#166534";
+    else if (camStreamSource === "img") bg = "#854d0e";
+    else if (camStreamSource === "snapshot") bg = "#7f1d1d";
+
+    camScreenCtx.save();
+    camScreenCtx.font = "bold 14px sans-serif";
+    var tw = camScreenCtx.measureText(label).width;
+    var px = 8, py = 6, pad = 6;
+    camScreenCtx.fillStyle = bg;
+    camScreenCtx.globalAlpha = 0.85;
+    camScreenCtx.fillRect(px, py, tw + pad * 2, 22);
+    camScreenCtx.globalAlpha = 1.0;
+    camScreenCtx.fillStyle = "#fff";
+    camScreenCtx.textAlign = "left";
+    camScreenCtx.textBaseline = "middle";
+    camScreenCtx.fillText(label, px + pad, py + 11);
+    camScreenCtx.restore();
+  }
+
+  // --- Strategy 0: WebRTC via go2rtc (lowest latency, native H.264) ---
+  function tryWebRtcStream() {
+    if (!camPiIp) {
+      console.log("[SCR] No Pi IP, skipping WebRTC → MSE");
+      tryMseStream();
+      return;
+    }
+    if (typeof RTCPeerConnection === "undefined") {
+      console.warn("[SCR] RTCPeerConnection not available → MSE");
+      tryMseStream();
+      return;
+    }
+
+    console.log("[SCR] === WebRTC START === target=" + camPiIp + ":" + camPiPort);
+    drawCamPlaceholder("WebRTC connecting...", "#666");
+
+    var pc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
+    camRtcPc = pc;
+    var rtcDone = false;
+    var trackReceived = false;
+    var bytesReceived = 0;
+
+    pc.addTransceiver("video", { direction: "recvonly" });
+    console.log("[SCR] Transceiver added (recvonly video)");
+
+    pc.oniceconnectionstatechange = function () {
+      console.log("[SCR] ICE connection: " + pc.iceConnectionState);
+      if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
+        if (!rtcDone) {
+          console.warn("[SCR] ICE FAILED — giving up");
+          cleanupRtc();
+          tryMseStream();
+        }
+      }
+    };
+
+    pc.onconnectionstatechange = function () {
+      console.log("[SCR] Connection state: " + pc.connectionState);
+    };
+
+    pc.onicecandidate = function (ev) {
+      if (ev.candidate) {
+        console.log("[SCR] ICE candidate: " + ev.candidate.type + " " +
+          ev.candidate.protocol + " " + ev.candidate.address);
+      }
+    };
+
+    pc.ontrack = function (ev) {
+      trackReceived = true;
+      var track = ev.track;
+      var stream = ev.streams[0];
+      console.log("[SCR] TRACK received  kind=" + track.kind +
+        "  readyState=" + track.readyState +
+        "  muted=" + track.muted +
+        "  streams=" + ev.streams.length);
+
+      if (!stream) {
+        console.warn("[SCR] No stream in ontrack event!");
+        return;
+      }
+
+      console.log("[SCR] Stream id=" + stream.id +
+        "  active=" + stream.active +
+        "  videoTracks=" + stream.getVideoTracks().length);
+
+      track.onmute = function () { console.warn("[SCR] Track MUTED"); };
+      track.onunmute = function () { console.log("[SCR] Track UNMUTED"); };
+      track.onended = function () { console.warn("[SCR] Track ENDED"); };
+
+      // Attach stream to video element for rendering
+      var vid = document.createElement("video");
+      vid.autoplay = true;
+      vid.muted = true;
+      vid.playsInline = true;
+      vid.setAttribute("webkit-playsinline", "true");
+      vid.style.cssText = "position:fixed;bottom:0;left:0;width:1px;height:1px;z-index:-1;pointer-events:none;";
+      document.body.appendChild(vid);
+      vid.srcObject = stream;
+      camStreamVideo = vid;
+
+      vid.play().catch(function (e) {
+        console.warn("[SCR] play() rejected: " + e.message);
+      });
+
+      console.log("[SCR] Video element created and srcObject set");
+      drawCamPlaceholder("Track received, waiting for data...", "#f59e0b");
+    };
+
+    // Stats polling — check if bytes are actually flowing
+    var statsPollCount = 0;
+    var statsInterval = setInterval(function () {
+      if (rtcDone || !camRtcPc) { clearInterval(statsInterval); return; }
+      statsPollCount++;
+
+      pc.getStats().then(function (stats) {
+        stats.forEach(function (report) {
+          if (report.type === "inbound-rtp" && report.kind === "video") {
+            var newBytes = report.bytesReceived || 0;
+            var fps = report.framesPerSecond || 0;
+            var decoded = report.framesDecoded || 0;
+            var dropped = report.framesDropped || 0;
+            var pktLost = report.packetsLost || 0;
+
+            console.log("[SCR] RTP stats: bytes=" + newBytes +
+              "  decoded=" + decoded +
+              "  fps=" + fps +
+              "  dropped=" + dropped +
+              "  lost=" + pktLost);
+
+            if (newBytes > 0 && decoded > 0 && !rtcDone) {
+              rtcDone = true;
+              camStreamSource = "webrtc";
+              drawCamPlaceholder("WebRTC data flowing! decoded=" + decoded, "#10b981");
+              console.log("[SCR] === DATA FLOWING === decoded=" + decoded + " frames");
+            }
+
+            bytesReceived = newBytes;
+          }
+        });
+      }).catch(function () {});
+
+      if (statsPollCount % 5 === 0 && !rtcDone) {
+        console.log("[SCR] Waiting... track=" + trackReceived +
+          "  ICE=" + pc.iceConnectionState +
+          "  conn=" + pc.connectionState +
+          "  signal=" + pc.signalingState +
+          "  bytes=" + bytesReceived);
+      }
+    }, 1000);
+
+    // Signaling
+    pc.createOffer().then(function (offer) {
+      console.log("[SCR] Offer created (" + offer.sdp.length + " bytes)");
+      return pc.setLocalDescription(offer);
+    }).then(function () {
+      console.log("[SCR] Local description set, gathering ICE...");
+      return new Promise(function (resolve) {
+        if (pc.iceGatheringState === "complete") {
+          resolve();
+        } else {
+          var checkState = function () {
+            if (pc.iceGatheringState === "complete") {
+              pc.removeEventListener("icegatheringstatechange", checkState);
+              resolve();
+            }
+          };
+          pc.addEventListener("icegatheringstatechange", checkState);
+          setTimeout(resolve, 3000);
+        }
+      });
+    }).then(function () {
+      if (rtcDone || pc.signalingState === "closed") return;
+
+      console.log("[SCR] ICE gathered (" + pc.iceGatheringState + "), sending offer...");
+      var apiUrl = "http://" + camPiIp + ":" + camPiPort + "/api/webrtc?src=camera";
+      drawCamPlaceholder("Sending offer to Pi...", "#666");
+
+      return fetch(apiUrl, {
+        method: "POST",
+        mode: "cors",
+        headers: { "Content-Type": "application/sdp" },
+        body: pc.localDescription.sdp,
+      });
+    }).then(function (resp) {
+      if (!resp) return;
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      console.log("[SCR] Pi responded " + resp.status);
+      return resp.text();
+    }).then(function (sdpAnswer) {
+      if (!sdpAnswer) return;
+      if (rtcDone || pc.signalingState === "closed") return;
+
+      console.log("[SCR] Answer received (" + sdpAnswer.length + " bytes)");
+      drawCamPlaceholder("Setting remote description...", "#666");
+      return pc.setRemoteDescription({ type: "answer", sdp: sdpAnswer });
+    }).then(function () {
+      console.log("[SCR] Remote description set — waiting for media");
+      drawCamPlaceholder("Waiting for media...", "#f59e0b");
+    }).catch(function (err) {
+      console.warn("[SCR] Signaling FAILED: " + (err.message || err));
+      drawCamPlaceholder("Signaling failed: " + (err.message || ""), "#ef4444");
+      if (!rtcDone) {
+        cleanupRtc();
+        tryMseStream();
+      }
+    });
+
+    setTimeout(function () {
+      if (!rtcDone) {
+        console.warn("[SCR] WebRTC TIMEOUT (15s)  track=" + trackReceived +
+          "  bytes=" + bytesReceived +
+          "  ICE=" + pc.iceConnectionState);
+        drawCamPlaceholder("WebRTC timeout — fallback", "#ef4444");
+        cleanupRtc();
+        tryMseStream();
+      }
+    }, 15000);
+
+    function cleanupRtc() {
+      clearInterval(statsInterval);
+      if (camRtcPc) { camRtcPc.close(); camRtcPc = null; }
+      if (camStreamVideo) {
+        camStreamVideo.pause();
+        camStreamVideo.srcObject = null;
+        if (camStreamVideo.parentNode) camStreamVideo.parentNode.removeChild(camStreamVideo);
+        camStreamVideo = null;
+      }
+    }
+  }
+
+  // --- Strategy 1: MSE via go2rtc WebSocket (H.264 live streams) ---
+  function tryMseStream() {
+    if (!camPiIp) {
+      console.log("[CAM] No Pi IP, skipping MSE — trying <video>");
+      tryVideoStream();
+      return;
+    }
+    if (typeof MediaSource === "undefined" || !MediaSource.isTypeSupported('video/mp4; codecs="avc1.640029"')) {
+      console.warn("[CAM] MSE not supported, skipping — trying <video>");
+      tryVideoStream();
+      return;
+    }
+
+    var wsUrl = "ws://" + camPiIp + ":" + camPiPort + "/api/ws?src=camera";
+    console.log("[CAM] Trying MSE WebSocket:", wsUrl);
+    drawCamPlaceholder("Trying MSE stream...", "#666");
+
+    var ms = new MediaSource();
+    var vid = document.createElement("video");
+    vid.autoplay = true;
+    vid.muted = true;
+    vid.playsInline = true;
+    vid.setAttribute("webkit-playsinline", "true");
+    camStreamVideo = vid;
+
+    vid.src = URL.createObjectURL(ms);
+
+    var mseOk = false;
+    var sb = null;
+    var queue = [];
+
+    ms.addEventListener("sourceopen", function () {
+      console.log("[CAM] MSE sourceopen");
+
+      var ws = new WebSocket(wsUrl);
+      ws.binaryType = "arraybuffer";
+      camMseWs = ws;
+
+      ws.onopen = function () {
+        console.log("[CAM] MSE WS connected, requesting mse stream");
+        ws.send(JSON.stringify({ type: "mse" }));
+      };
+
+      ws.onmessage = function (ev) {
+        if (typeof ev.data === "string") {
+          var msg = JSON.parse(ev.data);
+          console.log("[CAM] MSE codec info:", JSON.stringify(msg));
+          if (msg.type === "mse" && msg.value) {
+            try {
+              var mime = 'video/mp4; codecs="' + msg.value + '"';
+              console.log("[CAM] Adding SourceBuffer:", mime);
+              sb = ms.addSourceBuffer(mime);
+              sb.mode = "segments";
+              sb.addEventListener("updateend", function () {
+                if (queue.length > 0 && !sb.updating) {
+                  sb.appendBuffer(queue.shift());
+                }
+              });
+            } catch (e) {
+              console.error("[CAM] MSE addSourceBuffer failed:", e.message);
+              cleanupMse();
+              tryVideoStream();
+            }
+          }
+          return;
+        }
+
+        if (!sb) return;
+
+        if (sb.updating || queue.length > 0) {
+          if (queue.length < 10) {
+            queue.push(ev.data);
+          }
+        } else {
+          try {
+            sb.appendBuffer(ev.data);
+          } catch (e) {
+            console.warn("[CAM] MSE appendBuffer error:", e.message);
+          }
+        }
+
+        if (!mseOk && vid.readyState >= vid.HAVE_CURRENT_DATA) {
+          mseOk = true;
+          camStreamSource = "mse";
+          console.log("[CAM] MSE stream playing (" + vid.videoWidth + "x" + vid.videoHeight + ")");
+        }
+      };
+
+      ws.onerror = function () {
+        console.warn("[CAM] MSE WebSocket error");
+        if (!mseOk) {
+          cleanupMse();
+          tryVideoStream();
+        }
+      };
+
+      ws.onclose = function () {
+        console.warn("[CAM] MSE WebSocket closed");
+        if (!mseOk) {
+          cleanupMse();
+          tryVideoStream();
+        }
+      };
+    });
+
+    vid.play().catch(function () {});
+
+    setTimeout(function () {
+      if (camStreamSource === "none") {
+        console.warn("[CAM] MSE timed out (8s), trying <video>");
+        cleanupMse();
+        tryVideoStream();
+      }
+    }, 8000);
+
+    function cleanupMse() {
+      if (camMseWs) { camMseWs.close(); camMseWs = null; }
+      if (camStreamVideo) { camStreamVideo.pause(); camStreamVideo.src = ""; camStreamVideo = null; }
+    }
+  }
+
+  // --- Strategy 1: <video> element (MP4 — direct Pi or proxied) ---
+  function tryVideoStream() {
+    if (!camUrls.video) { tryMjpegImg(); return; }
+    console.log("[CAM] Trying <video>:", camUrls.video);
+    drawCamPlaceholder("Trying video stream...", "#666");
+
+    var vid = document.createElement("video");
+    vid.crossOrigin = "anonymous";
+    vid.autoplay = true;
+    vid.muted = true;
+    vid.playsInline = true;
+    vid.setAttribute("webkit-playsinline", "true");
+    vid.setAttribute("x-webkit-airplay", "deny");
+    vid.preload = "auto";
+    camStreamVideo = vid;
+
+    vid.addEventListener("loadeddata", function () {
+      console.log("[CAM] <video> loadeddata  readyState=" + vid.readyState +
+        "  size=" + vid.videoWidth + "x" + vid.videoHeight);
+    });
+
+    vid.addEventListener("playing", function () {
+      if (camStreamSource !== "none") return;
+      camStreamSource = "video";
+      console.log("[CAM] Video stream playing (" + vid.videoWidth + "x" + vid.videoHeight + ")");
+    });
+
+    vid.addEventListener("stalled", function () {
+      console.warn("[CAM] <video> stalled");
+    });
+
+    vid.addEventListener("error", function () {
+      if (camStreamSource !== "none") return;
+      var err = vid.error;
+      var detail = err
+        ? "code=" + err.code + " msg=" + (err.message || "none")
+        : "no error object";
+      console.warn("[CAM] <video> error: " + detail);
+      camStreamVideo = null;
+      tryMjpegImg();
+    });
+
+    vid.src = camUrls.video;
+    vid.load();
+
+    vid.play().catch(function (e) {
+      console.warn("[CAM] <video> play() rejected: " + e.name + ": " + e.message);
+    });
+
+    setTimeout(function () {
+      if (camStreamSource === "none") {
+        var state = vid.readyState;
+        var neterr = vid.error ? "code=" + vid.error.code : "none";
+        console.warn("[CAM] <video> timed out (6s)  readyState=" + state +
+          "  networkState=" + vid.networkState + "  error=" + neterr);
+        if (camStreamVideo) { camStreamVideo.pause(); camStreamVideo.src = ""; camStreamVideo = null; }
+        tryMjpegImg();
+      }
+    }, 6000);
+  }
+
+  // --- Strategy 2: <img> element (MJPEG — direct Pi or laptop) ---
+  function tryMjpegImg() {
+    if (camStreamSource !== "none") return;
+    if (!camUrls.mjpeg) { startSnapshotFallback(); return; }
+    console.log("[CAM] Trying MJPEG <img>:", camUrls.mjpeg);
+
+    camStreamImg = new Image();
+    camStreamImg.crossOrigin = "anonymous";
+
+    camStreamImg.addEventListener("load", function onFirst() {
+      camStreamImg.removeEventListener("load", onFirst);
+      if (camStreamSource !== "none") return;
+      camStreamSource = "img";
+      console.log("[CAM] MJPEG img stream connected");
+    });
+
+    camStreamImg.addEventListener("error", function () {
+      if (camStreamSource !== "none") return;
+      console.warn("[CAM] MJPEG <img> error on " + camUrls.mjpeg);
+      camStreamImg = null;
+      startSnapshotFallback();
+    });
+
+    camStreamImg.src = camUrls.mjpeg;
+
+    setTimeout(function () {
+      if (camStreamSource === "none") {
+        console.warn("[CAM] MJPEG <img> timed out (4s) on " + camUrls.mjpeg);
+        if (camStreamImg) { camStreamImg.src = ""; camStreamImg = null; }
+        startSnapshotFallback();
+      }
+    }, 4000);
+  }
+
+  // --- Strategy 3: snapshot polling ---
+  function startSnapshotFallback() {
+    if (camStreamSource !== "none") return;
+    camStreamSource = "snapshot";
+    var url = camUrls.snapshot || camProxyUrls.snapshot;
+    console.log("[CAM] Using snapshot polling: " + url +
+      (camUsingDirect ? " (direct Pi)" : " (proxy)"));
+    fetchSnapshot();
+  }
+
+  var camSnapshotUrl = null;  // resolved at first fetch
+
+  function fetchSnapshot() {
+    if (!camFeedRunning || camStreamSource !== "snapshot") return;
+
+    if (!camSnapshotUrl) {
+      camSnapshotUrl = camUrls.snapshot || camProxyUrls.snapshot;
+    }
+
+    var url = camSnapshotUrl + "?t=" + Date.now();
+    fetch(url, { mode: "cors" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.blob();
+      })
+      .then(function (blob) {
+        var objectUrl = URL.createObjectURL(blob);
+        var img = new Image();
+        img.onload = function () {
+          camScreenCtx.drawImage(img, 0, 0, camScreenCanvas.width, camScreenCanvas.height);
+          drawModeLabel();
+          camScreenTexture.needsUpdate = true;
+          URL.revokeObjectURL(objectUrl);
+          if (camSnapshotFailures > 0) {
+            console.log("[CAM] Snapshot recovered after " + camSnapshotFailures + " failures");
+          }
+          camSnapshotFailures = 0;
+          if (camFeedRunning) fetchSnapshot();
+        };
+        img.onerror = function () {
+          URL.revokeObjectURL(objectUrl);
+          camSnapshotFailures++;
+          if (camFeedRunning) setTimeout(fetchSnapshot, 500);
+        };
+        img.src = objectUrl;
+      })
+      .catch(function (err) {
+        camSnapshotFailures++;
+        if (camSnapshotFailures === 3 && camUsingDirect) {
+          console.warn("[CAM] Direct Pi snapshots failing, switching to proxy");
+          camSnapshotUrl = camProxyUrls.snapshot;
+        }
+        if (camSnapshotFailures >= 3) {
+          drawCamPlaceholder("Camera lost (" + camSnapshotFailures + " fails)", "#ef4444");
+        }
+        if (camFeedRunning) setTimeout(fetchSnapshot, 1000);
+      });
+  }
+
+  // Called every XR frame — draw video onto the camera screen texture
+  function updateCameraTexture() {
+    if (!camScreenCtx || !camScreenTexture) return;
+    if (camStreamSource !== "webrtc" || !camStreamVideo) return;
+
+    try {
+      camScreenCtx.save();
+      camScreenCtx.translate(camScreenCanvas.width, camScreenCanvas.height);
+      camScreenCtx.rotate(Math.PI);
+      camScreenCtx.drawImage(camStreamVideo, 0, 0,
+        camScreenCanvas.width, camScreenCanvas.height);
+      camScreenCtx.restore();
+      drawModeLabel();
+      camScreenTexture.needsUpdate = true;
+      camFrameCount++;
+      if (camFrameCount === 1) {
+        console.log("[SCR] First frame drawn to screen!");
+      }
+    } catch (e) {
+      if (camFrameCount === 0) {
+        console.error("[SCR] drawImage error: " + e.name + ": " + e.message);
+      }
+    }
+  }
+
+  function stopCameraStream() {
+    camFeedRunning = false;
+    if (camRtcPc) {
+      camRtcPc.close();
+      camRtcPc = null;
+    }
+    if (camMseWs) {
+      camMseWs.close();
+      camMseWs = null;
+    }
+    if (camStreamVideo) {
+      camStreamVideo.pause();
+      camStreamVideo.srcObject = null;
+      camStreamVideo.src = "";
+      if (camStreamVideo.parentNode) camStreamVideo.parentNode.removeChild(camStreamVideo);
+      camStreamVideo = null;
+    }
+    if (camStreamImg) {
+      camStreamImg.src = "";
+      camStreamImg = null;
+    }
+    camStreamSource = "none";
+    camFrameCount = 0;
+  }
+
+  function restartCameraFeed() {
+    console.log("[CAM] Restarting camera pipeline...");
+    stopCameraStream();
+    camSnapshotFailures = 0;
+    camSnapshotUrl = null;
+    camUsingDirect = false;
+    camUrls = { video: null, mjpeg: null, snapshot: null };
+    camFeedRunning = true;
+    drawCamPlaceholder("Reconnecting camera...", "#f59e0b");
+
+    fetch(camBackendUrl + "/camera/info", { mode: "cors" })
+      .then(function (r) { return r.json(); })
+      .then(function (info) {
+        console.log("[CAM] Camera info:", JSON.stringify(info));
+        if (info.source === "pi" && info.stream_url) {
+          camPiIp = info.pi_ip;
+          camPiPort = info.go2rtc_port || 1984;
+          camUrls.video = info.stream_url;
+          camUrls.mjpeg = null;
+          camUrls.snapshot = info.snapshot_url;
+          camUsingDirect = true;
+          console.log("[CAM] Pi mode — direct to " + info.pi_ip + ":" + camPiPort + " (H.264 source)");
+        } else {
+          camPiIp = null;
+          camUrls = Object.assign({}, camProxyUrls);
+          camUsingDirect = false;
+          console.log("[CAM] Laptop mode — streaming via backend proxy");
+        }
+        tryWebRtcStream();
+      })
+      .catch(function (err) {
+        console.warn("[CAM] /camera/info failed, using backend proxy:", err);
+        camPiIp = null;
+        camUrls = Object.assign({}, camProxyUrls);
+        camUsingDirect = false;
+        tryWebRtcStream();
+      });
+  }
+
+  function positionCameraScreen(frame) {
+    if (!camScreenMesh) return;
+    var xrCam = renderer.xr.getCamera();
+
+    if (!camScreenPlaced) {
+      var camPos = new THREE.Vector3();
+      var camDir = new THREE.Vector3(0, 0, -1);
+      xrCam.getWorldPosition(camPos);
+      xrCam.getWorldDirection(camDir);
+      camDir.y = 0;
+      camDir.normalize();
+      var screenPos = camPos.clone().add(camDir.multiplyScalar(1.2));
+      screenPos.y = camPos.y - 0.05;
+      camScreenMesh.position.copy(screenPos);
+      camScreenPlaced = true;
+      console.log("[CAM] Screen placed at", screenPos.x.toFixed(2),
+        screenPos.y.toFixed(2), screenPos.z.toFixed(2));
+    }
+
+    var camPos2 = new THREE.Vector3();
+    xrCam.getWorldPosition(camPos2);
+    camScreenMesh.lookAt(camPos2);
+  }
+
+  // ================================================================
+  //  Read joystick + buttons from both controllers
+  // ================================================================
+  function readJoystickAxes(src) {
+    if (!src.gamepad) return { x: 0, y: 0 };
+    var axes = src.gamepad.axes;
+    var x = 0, y = 0;
+    if (axes.length >= 4) { x = axes[2]; y = axes[3]; }
+    else if (axes.length >= 2) { x = axes[0]; y = axes[1]; }
+    return { x: x, y: y };
+  }
+
+  function readXRInputs(sources) {
+    for (var i = 0; i < sources.length; i++) {
+      var src = sources[i];
+      if (src.handedness === "left" && src.gamepad) {
+        var leftAxes = readJoystickAxes(src);
+        joyForward = -leftAxes.y;
+
+        var lbtns = src.gamepad.buttons;
+        if (!buttonMapLogged) {
+          for (var lb = 0; lb < lbtns.length; lb++) {
+            if (lbtns[lb].pressed) {
+              console.log("[BTN] Left btn[" + lb + "] pressed  (" +
+                lbtns.length + " btns)");
+            }
+          }
+        }
+
+        // Left A (index 5) → toggle error screen
+        var leftA = lbtns.length > 5 && lbtns[5].pressed;
+        if (leftA && !prevLeftA) {
+          errorScreenVisible = !errorScreenVisible;
+          console.log("[BTN] LeftA(5) → errorScreen=" + errorScreenVisible);
+        }
+        prevLeftA = leftA;
+
+        // Left Menu (index 4) → toggle debug log screen
+        var leftMenu = lbtns.length > 4 && lbtns[4].pressed;
+        if (leftMenu && !prevLeftMenu) {
+          debugLogVisible = !debugLogVisible;
+          console.log("[BTN] LeftMenu(4) → debugLog=" + debugLogVisible);
+        }
+        prevLeftMenu = leftMenu;
+
+        // Left B (index 6) → restart camera feed pipeline
+        var leftB = lbtns.length > 6 && lbtns[6].pressed;
+        if (leftB && !prevLeftB) {
+          console.log("[BTN] LeftB(6) → restart camera feed");
+          restartCameraFeed();
+        }
+        prevLeftB = leftB;
+      }
+      if (src.handedness === "right" && src.gamepad) {
+        var rightAxes = readJoystickAxes(src);
+        joySteer = rightAxes.x;
+
+        var btns = src.gamepad.buttons;
+        if (!buttonMapLogged) {
+          for (var b = 0; b < btns.length; b++) {
+            if (btns[b].pressed) {
+              console.log("[BTN] Right btn[" + b + "] pressed  (" +
+                btns.length + " btns)");
+            }
+          }
+        }
+
+        // Right A (index 5) → turbo, Right B (index 4) → donut
+        var btnA = btns.length > 5 && btns[5].pressed;
+        var btnB = btns.length > 4 && btns[4].pressed;
+
+        if (btnA && !prevBtnA) {
+          turboOn = !turboOn;
+          console.log("[BTN] RightA(5) → turbo=" + turboOn);
+          drawHud();
+        }
+        if (btnB && !prevBtnB) {
+          donutOn = !donutOn;
+          console.log("[BTN] RightB(4) → donut=" + donutOn);
+          drawHud();
+        }
+        prevBtnA = btnA;
+        prevBtnB = btnB;
+      }
+    }
+  }
+
+  // ================================================================
+  //  Screen grab — hold trigger (index 0) on either controller
+  // ================================================================
+  function handleScreenGrab(sources, frame) {
+    if (!camScreenMesh || !xrRefSpace) return;
+
+    var anyTrigger = false;
+
+    for (var i = 0; i < sources.length; i++) {
+      var src = sources[i];
+      if (!src.gamepad) continue;
+      var btns = src.gamepad.buttons;
+      var triggerDown = btns.length > 0 && btns[0].pressed;
+      if (!triggerDown) continue;
+
+      var space = src.gripSpace || src.targetRaySpace;
+      if (!space) continue;
+      var pose = frame.getPose(space, xrRefSpace);
+      if (!pose) continue;
+
+      var ctrlPos = new THREE.Vector3(
+        pose.transform.position.x,
+        pose.transform.position.y,
+        pose.transform.position.z
+      );
+
+      if (!grabbing) {
+        grabbing = true;
+        grabOffset.copy(camScreenMesh.position).sub(ctrlPos);
+        console.log("[GRAB] Started with " + (src.handedness || "unknown") + " controller");
+      }
+
+      camScreenMesh.position.copy(ctrlPos).add(grabOffset);
+
+      var xrCam = renderer.xr.getCamera();
+      var eyePos = new THREE.Vector3();
+      xrCam.getWorldPosition(eyePos);
+      camScreenMesh.lookAt(eyePos);
+
+      anyTrigger = true;
+      break;
+    }
+
+    if (!anyTrigger && grabbing) {
+      grabbing = false;
+      console.log("[GRAB] Released");
+    }
+  }
+
+  // ================================================================
+  //  WebXR session
   // ================================================================
   var xrSession = null;
   var xrRefSpace = null;
 
   function checkWebXR() {
-    if (!navigator.xr) return;
+    if (!navigator.xr) {
+      console.log("[XR] navigator.xr not available");
+      return;
+    }
     navigator.xr.isSessionSupported("immersive-ar").then(function (ok) {
       if (!ok) {
         navigator.xr.isSessionSupported("immersive-vr").then(function (ok2) {
           if (ok2) showXRPrompt("immersive-vr");
+          else console.log("[XR] Neither immersive-ar nor immersive-vr supported");
         });
       } else {
         showXRPrompt("immersive-ar");
@@ -352,11 +1724,23 @@ html, body {
   }
 
   function showXRPrompt(sessionType) {
+    console.log("[XR] Session type available:", sessionType);
     xrPrompt.classList.remove("hidden");
     btnStartXR.onclick = function () { startXR(sessionType); };
   }
 
   function startXR(sessionType) {
+    console.log("[XR] startXR called with", sessionType);
+
+    try {
+      initThree();
+      console.log("[XR] Three.js initialised");
+    } catch (e) {
+      console.error("[XR] initThree() failed:", e);
+      alert("Three.js init failed: " + e.message);
+      return;
+    }
+
     navigator.xr.requestSession(sessionType, {
       optionalFeatures: ["local-floor", "hand-tracking"],
     }).then(function (session) {
@@ -365,69 +1749,95 @@ html, body {
       modeBadge.textContent = "WebXR";
       modeBadge.className = "mode-badge xr";
       xrPrompt.classList.add("hidden");
+      console.log("[XR] Session started:", sessionType);
+
+      renderer.xr.setSession(session);
+
+      try { createHud(); } catch (e) {
+        console.error("[XR] createHud failed:", e);
+      }
+      try { createErrorScreen(); } catch (e) {
+        console.error("[XR] createErrorScreen failed:", e);
+      }
+      try { createDebugScreen(); } catch (e) {
+        console.error("[XR] createDebugScreen failed:", e);
+      }
+      hookConsoleLogs();
+      try { createCameraScreen(); } catch (e) {
+        console.error("[XR] createCameraScreen failed:", e);
+      }
 
       session.requestReferenceSpace("local-floor").then(function (refSpace) {
         xrRefSpace = refSpace;
-        session.requestAnimationFrame(onXRFrame);
-      }).catch(function () {
+        console.log("[XR] Got local-floor reference space");
+        renderer.setAnimationLoop(onXRFrame);
+      }).catch(function (e) {
+        console.warn("[XR] local-floor failed, trying local:", e);
         session.requestReferenceSpace("local").then(function (refSpace) {
           xrRefSpace = refSpace;
-          session.requestAnimationFrame(onXRFrame);
+          console.log("[XR] Got local reference space (fallback)");
+          renderer.setAnimationLoop(onXRFrame);
+        }).catch(function (e2) {
+          console.error("[XR] No reference space available:", e2);
         });
       });
 
       session.addEventListener("end", function () {
+        console.log("[XR] Session ended");
         xrSession = null;
         xrRefSpace = null;
         inputMode = "none";
+        renderer.setAnimationLoop(null);
+        if (hudMesh) hudMesh.visible = false;
+        if (errMesh) errMesh.visible = false;
+        if (dbgMesh) dbgMesh.visible = false;
+        stopCameraStream();
+        camScreenPlaced = false;
+        if (camScreenMesh) camScreenMesh.visible = false;
         startGyroFallback();
       });
     }).catch(function (err) {
-      console.warn("WebXR session failed:", err);
+      console.error("[XR] requestSession failed:", err);
       startGyroFallback();
     });
   }
 
   function onXRFrame(time, frame) {
-    if (!xrSession) return;
-    xrSession.requestAnimationFrame(onXRFrame);
+    if (!xrSession || !frame) return;
 
-    var sources = frame.session.inputSources;
+    var sources = xrSession.inputSources;
+
+    // Update controller markers
     for (var i = 0; i < sources.length; i++) {
       var src = sources[i];
       var space = src.gripSpace || src.targetRaySpace;
       if (!space) continue;
-
       var pose = frame.getPose(space, xrRefSpace);
-      if (pose) {
-        var q = pose.transform.orientation;
-        // quaternion → pitch (around X) and roll (around Z)
-        var sinP = 2.0 * (q.w * q.x - q.y * q.z);
-        sinP = Math.max(-1, Math.min(1, sinP));
-        pitch = Math.asin(sinP) * (180 / Math.PI);
+      if (!pose) continue;
 
-        var sinR = 2.0 * (q.w * q.z + q.x * q.y);
-        var cosR = 1.0 - 2.0 * (q.x * q.x + q.z * q.z);
-        roll = Math.atan2(sinR, cosR) * (180 / Math.PI);
-
-        updateVisuals();
-      }
-
-      if (src.gamepad) {
-        var gp = src.gamepad;
-        buttons.trigger = gp.buttons.length > 0 && gp.buttons[0].pressed;
-        buttons.a = gp.buttons.length > 4 && gp.buttons[4].pressed;
-        buttons.b = gp.buttons.length > 5 && gp.buttons[5].pressed;
-      }
-
-      break; // use first controller only
+      var hand = src.handedness || ("ctrl" + i);
+      var marker = getOrCreateMarker(hand);
+      var pos = pose.transform.position;
+      var ori = pose.transform.orientation;
+      marker.position.set(pos.x, pos.y, pos.z);
+      marker.quaternion.set(ori.x, ori.y, ori.z, ori.w);
     }
+
+    readXRInputs(sources);
+    handleScreenGrab(sources, frame);
+    positionHud(frame, sources);
+    positionErrorScreen(frame, sources);
+    positionDebugScreen(frame, sources);
+    if (!grabbing) positionCameraScreen(frame);
+    updateCameraTexture();
+    updateVisuals();
+
+    renderer.render(scene, camera);
   }
 
   // ================================================================
-  //  INPUT MODE 2: DeviceOrientation (phone gyroscope fallback)
+  //  Gyro fallback
   // ================================================================
-
   function startGyroFallback() {
     if (inputMode === "webxr") return;
     inputMode = "gyro";
@@ -463,38 +1873,18 @@ html, body {
     });
   }
 
-  // ---- Action buttons ----
+  // ---- On-screen action buttons (non-XR) ----
   btnLights.addEventListener("click", function () {
-    buttons.a = true;
-    btnLights.classList.toggle("active-lights");
-    setTimeout(function () { buttons.a = false; }, 100);
+    lightsOn = !lightsOn;
+    btnLights.classList.toggle("active-lights", lightsOn);
   });
-
   btnTurbo.addEventListener("click", function () {
-    buttons.b = true;
-    btnTurbo.classList.toggle("active-turbo");
-    setTimeout(function () { buttons.b = false; }, 100);
+    turboOn = !turboOn;
+    btnTurbo.classList.toggle("active-turbo", turboOn);
   });
-
-  btnDonut.addEventListener("touchstart", function (e) {
-    e.preventDefault();
-    buttons.trigger = true;
-    btnDonut.classList.add("active-donut");
-  }, { passive: false });
-  btnDonut.addEventListener("touchend", function (e) {
-    e.preventDefault();
-    buttons.trigger = false;
-    btnDonut.classList.remove("active-donut");
-  }, { passive: false });
-  btnDonut.addEventListener("mousedown", function (e) {
-    e.preventDefault();
-    buttons.trigger = true;
-    btnDonut.classList.add("active-donut");
-  });
-  btnDonut.addEventListener("mouseup", function (e) {
-    e.preventDefault();
-    buttons.trigger = false;
-    btnDonut.classList.remove("active-donut");
+  btnDonut.addEventListener("click", function () {
+    donutOn = !donutOn;
+    btnDonut.classList.toggle("active-donut", donutOn);
   });
 
   // ---- Recalibrate gyro on double-tap ----
@@ -512,7 +1902,6 @@ html, body {
   connectWS();
   checkWebXR();
 
-  // If WebXR isn't available after a short delay, fall back to gyro
   setTimeout(function () {
     if (inputMode === "none") startGyroFallback();
   }, 1500);

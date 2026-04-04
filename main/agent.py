@@ -11,6 +11,7 @@ Environment variables:
     CAMERA_SNAPSHOT_URL   Override: full URL for a JPEG frame, e.g.
                           http://192.168.1.50:1984/api/frame.jpeg?src=camera
                           Defaults to {BACKEND_URL}/camera/snapshot
+    AGENTIC_MODE          1/true to enable autonomous mode; 0/false disables it
     OPENAI_API_KEY        OpenAI API key (required for vision analysis)
     AGENT_INTERVAL        Seconds between vision calls (default 1.0)
 """
@@ -29,6 +30,7 @@ log = logging.getLogger("agent")
 _BACKEND = os.getenv("BACKEND_URL", "http://localhost:3000").rstrip("/")
 CAMERA_SNAPSHOT_URL = os.getenv("CAMERA_SNAPSHOT_URL", f"{_BACKEND}/camera/snapshot")
 AGENT_INTERVAL = float(os.getenv("AGENT_INTERVAL", "1.0"))
+AGENTIC_MODE = os.getenv("AGENTIC_MODE", "1").lower() in ("1", "true", "yes", "on")
 
 SYSTEM_PROMPT = """\
 You are an autonomous AI copilot for a small remote-controlled car.
@@ -68,13 +70,16 @@ class DrivingAgent:
     """
 
     def __init__(self):
+        self.enabled = AGENTIC_MODE
         self.active = False
         self.running = True
         self._control: dict = dict(ZERO)
         self._http: aiohttp.ClientSession | None = None
         self._openai: AsyncOpenAI | None = None
 
-        if os.getenv("OPENAI_API_KEY"):
+        if not self.enabled:
+            log.info("Agentic mode disabled (AGENTIC_MODE=0) — OpenAI calls are off")
+        elif os.getenv("OPENAI_API_KEY"):
             self._openai = AsyncOpenAI()
             log.info("OpenAI client initialised")
         else:
@@ -161,6 +166,10 @@ class DrivingAgent:
     # ---- main loop ----
 
     async def run(self):
+        if not self.enabled:
+            log.info("Agent loop skipped (agentic mode disabled)")
+            return
+
         log.info(
             "Agent loop started  snapshot=%s  interval=%.1fs",
             CAMERA_SNAPSHOT_URL or "(none)",

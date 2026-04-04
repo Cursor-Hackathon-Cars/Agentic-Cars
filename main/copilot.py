@@ -39,6 +39,10 @@ import os
 import signal
 import socket
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import aiohttp
 
 from agent import DrivingAgent
@@ -146,7 +150,7 @@ class Copilot:
             await asyncio.sleep(10)
 
     async def _run_mode_switcher(self):
-        """Watch Zapbox activity and toggle between manual / autonomous."""
+        """Watch Zapbox activity and toggle between manual / autonomous / idle."""
         while self.running:
             if not self.car_connected:
                 if self.mode != "idle":
@@ -161,10 +165,16 @@ class Copilot:
                     self.agent.active = False
                     log.info("-> MANUAL  (Zapbox active)")
             else:
-                if self.mode != "autonomous":
-                    self.mode = "autonomous"
-                    self.agent.active = True
-                    log.info("-> AUTONOMOUS  (Agent taking over)")
+                if self.agent.enabled:
+                    if self.mode != "autonomous":
+                        self.mode = "autonomous"
+                        self.agent.active = True
+                        log.info("-> AUTONOMOUS  (Agent taking over)")
+                else:
+                    if self.mode != "idle":
+                        self.mode = "idle"
+                        self.agent.active = False
+                        log.info("-> IDLE  (Agentic mode disabled)")
 
             await asyncio.sleep(0.1)
 
@@ -174,6 +184,7 @@ class Copilot:
             forward=0, reverse=0, left=0, right=0,
             lights=0, turbo=0, donut=0,
         )
+        ctrl_log_count = 0
         while self.running:
             if not self.car_connected or self.http is None:
                 await asyncio.sleep(0.1)
@@ -185,6 +196,16 @@ class Copilot:
                 ctrl = self.agent.get_control()
             else:
                 ctrl = ZERO
+
+            ctrl_log_count += 1
+            has_input = any(v != 0 for v in ctrl.values())
+            if ctrl_log_count % 40 == 1 or has_input:
+                log.info(
+                    "POST /car/control  mode=%s  zapbox.connected=%s  "
+                    "zapbox.active=%s  ctrl=%s",
+                    self.mode, self.zapbox.connected,
+                    self.zapbox.is_active(), ctrl,
+                )
 
             await self._post("/car/control", ctrl)
             await asyncio.sleep(1.0 / 20)
@@ -211,17 +232,25 @@ class Copilot:
             "  Controller → open controller.html on your phone and enter: %s:%d",
             local_ip, self.zapbox.port,
         )
+        log.info("  AGENTIC_MODE = %s", "on" if self.agent.enabled else "OFF")
+
+        if not self.agent.enabled:
+            logging.getLogger("httpx").setLevel(logging.WARNING)
+            logging.getLogger("openai").setLevel(logging.WARNING)
 
         self.http = aiohttp.ClientSession()
+        tasks = [
+            self._run_status_poller(),
+            self._run_auto_connect(),
+            self._run_mode_switcher(),
+            self._run_control_loop(),
+            self.zapbox.run(),
+        ]
+        if self.agent.enabled:
+            tasks.append(self.agent.run())
+
         try:
-            await asyncio.gather(
-                self._run_status_poller(),
-                self._run_auto_connect(),
-                self._run_mode_switcher(),
-                self._run_control_loop(),
-                self.zapbox.run(),
-                self.agent.run(),
-            )
+            await asyncio.gather(*tasks)
         finally:
             await self.http.close()
 

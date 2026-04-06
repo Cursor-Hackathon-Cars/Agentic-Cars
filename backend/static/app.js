@@ -10,6 +10,7 @@
 
   // ---- DOM refs ----
   const cameraFeed = $("camera-feed");
+  const cameraFeedImg = $("camera-feed-img");
   const btnScan = $("btn-scan");
   const scanResults = $("scan-results");
   const carConnectedInfo = $("car-connected-info");
@@ -31,6 +32,7 @@
   let carConnected = false;
   let cameraConnected = false;
   let statusPollTimer = null;
+  let snapshotTimer = null;
 
   const control = {
     forward: 0, reverse: 0, left: 0, right: 0,
@@ -40,6 +42,20 @@
   // ---- Helpers ----
   function show(el) { el.classList.remove("hidden"); }
   function hide(el) { el.classList.add("hidden"); }
+
+  function stopCameraFeed() {
+    if (snapshotTimer) {
+      if (snapshotTimer.stop) snapshotTimer.stop();
+      else clearInterval(snapshotTimer);
+      snapshotTimer = null;
+    }
+    cameraFeed.pause();
+    cameraFeed.removeAttribute("src");
+    cameraFeed.load();
+    cameraFeedImg.removeAttribute("src");
+    hide(cameraFeed);
+    hide(cameraFeedImg);
+  }
 
   function showError(msg) {
     errorBanner.textContent = msg;
@@ -203,10 +219,80 @@
     btnCameraConnect.textContent = "Connecting…";
     btnCameraConnect.disabled = true;
     try {
-      await api("POST", "/camera/connect");
-      // Start MJPEG stream
-      cameraFeed.src = "/camera/stream?" + Date.now();
-      show(cameraFeed);
+      const camInfo = await api("POST", "/camera/connect");
+      stopCameraFeed();
+
+      const tryVideoStream = async () => {
+        return await new Promise((resolve) => {
+          let done = false;
+          const finish = (ok) => {
+            if (done) return;
+            done = true;
+            cameraFeed.onplaying = null;
+            cameraFeed.onerror = null;
+            resolve(ok);
+          };
+
+          cameraFeed.src = "/camera/stream?" + Date.now();
+          cameraFeed.play().catch(() => {});
+
+          cameraFeed.onplaying = () => finish(true);
+          cameraFeed.onerror = () => finish(false);
+
+          setTimeout(() => finish(cameraFeed.readyState >= 2), 2500);
+        });
+      };
+
+      const startSnapshotFallback = () => {
+        show(cameraFeedImg);
+        hide(cameraFeed);
+
+        let running = true;
+        let failures = 0;
+        const next = () => {
+          if (!running) return;
+          const img = new Image();
+          img.onload = () => {
+            if (!running) return;
+            failures = 0;
+            cameraFeedImg.src = img.src;
+            camStatusDot.className = "status-dot dot-on";
+            hide(errorBanner);
+            requestAnimationFrame(next);
+          };
+          img.onerror = () => {
+            if (!running) return;
+            failures++;
+            if (failures >= 3) {
+              camStatusDot.className = "status-dot dot-warn";
+              errorBanner.textContent =
+                "Camera stream lost — retrying… (" + failures + " failures)";
+              show(errorBanner);
+            }
+            setTimeout(next, 1000);
+          };
+          img.src = "/camera/snapshot?t=" + Date.now();
+        };
+        next();
+
+        snapshotTimer = { stop() { running = false; hide(errorBanner); } };
+      };
+
+      const isZapbox = /Zapbox/i.test(navigator.userAgent);
+      const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+      const forceSnapshot = camInfo.source === "laptop_camera" || isZapbox || isMobile;
+
+      if (forceSnapshot) {
+        startSnapshotFallback();
+      } else {
+        show(cameraFeed);
+        hide(cameraFeedImg);
+        const ok = await tryVideoStream();
+        if (!ok) {
+          startSnapshotFallback();
+        }
+      }
+
       cameraConnected = true;
       camStatusDot.className = "status-dot dot-on";
       hide(btnCameraConnect);
@@ -220,8 +306,7 @@
 
   // ---- Camera: Disconnect ----
   btnCameraDisconnect.addEventListener("click", () => {
-    cameraFeed.src = "";
-    hide(cameraFeed);
+    stopCameraFeed();
     cameraConnected = false;
     camStatusDot.className = "status-dot dot-off";
     show(btnCameraConnect);

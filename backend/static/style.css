@@ -21,6 +21,17 @@ html, body {
   background: #000;
 }
 
+#camera-feed-img {
+  position: fixed; inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  transform: rotate(180deg);
+  z-index: 0;
+  background: #000;
+}
+
+#camera-feed::-webkit-media-controls { display: none !important; }
+
 /* ===== Overlays ===== */
 .overlay {
   position: fixed; inset: 0;

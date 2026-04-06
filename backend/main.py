@@ -1,13 +1,28 @@
+import logging
 import os
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
+import threading
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent / "main" / ".env", override=True)
 
 import httpx
 from fastapi import FastAPI
+
+log = logging.getLogger("backend")
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from bleak import BleakScanner, BleakClient
+
+try:
+    import cv2  # Optional dependency for local webcam test mode.
+except Exception:
+    cv2 = None
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -16,6 +31,17 @@ PORT = int(os.environ.get("PORT", "3000"))
 PI_IP = os.environ.get("PI_IP", "172.20.10.2")
 GO2RTC_PORT = int(os.environ.get("GO2RTC_PORT", "1984"))
 GO2RTC_BASE = f"http://{PI_IP}:{GO2RTC_PORT}"
+USE_LAPTOP_CAMERA = os.environ.get("USE_LAPTOP_CAMERA", "0").lower() in (
+    "1", "true", "yes", "on"
+)
+
+LAPTOP_CAMERA_INDEX = int(os.environ.get("LAPTOP_CAMERA_INDEX", "0"))
+LAPTOP_CAMERA_WIDTH = int(os.environ.get("LAPTOP_CAMERA_WIDTH", "1280"))
+LAPTOP_CAMERA_HEIGHT = int(os.environ.get("LAPTOP_CAMERA_HEIGHT", "720"))
+LAPTOP_CAMERA_FPS = max(1, int(os.environ.get("LAPTOP_CAMERA_FPS", "20")))
+LAPTOP_CAMERA_JPEG_QUALITY = max(
+    1, min(100, int(os.environ.get("LAPTOP_CAMERA_JPEG_QUALITY", "80")))
+)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -41,6 +67,60 @@ class CarState:
 car = CarState()
 
 
+class LaptopCamera:
+    """Thread-safe local webcam wrapper for test mode."""
+
+    def __init__(self):
+        self._cap = None
+        self._lock = threading.Lock()
+
+    def start(self):
+        if cv2 is None:
+            raise RuntimeError(
+                "USE_LAPTOP_CAMERA is enabled but OpenCV is not installed. "
+                "Install it with: pip install opencv-python"
+            )
+
+        cap = cv2.VideoCapture(LAPTOP_CAMERA_INDEX)
+        if not cap or not cap.isOpened():
+            raise RuntimeError(
+                f"Cannot open laptop camera index {LAPTOP_CAMERA_INDEX}"
+            )
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, LAPTOP_CAMERA_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, LAPTOP_CAMERA_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, LAPTOP_CAMERA_FPS)
+        self._cap = cap
+
+    def stop(self):
+        with self._lock:
+            if self._cap is not None:
+                self._cap.release()
+                self._cap = None
+
+    def is_ready(self) -> bool:
+        return self._cap is not None
+
+    def read_jpeg(self) -> bytes | None:
+        if self._cap is None:
+            return None
+        with self._lock:
+            ok, frame = self._cap.read()
+            if not ok:
+                return None
+            ok, encoded = cv2.imencode(
+                ".jpg",
+                frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), LAPTOP_CAMERA_JPEG_QUALITY],
+            )
+            if not ok:
+                return None
+            return encoded.tobytes()
+
+
+laptop_camera = LaptopCamera()
+
+
 # ---------------------------------------------------------------------------
 # 20 Hz BLE control loop
 # ---------------------------------------------------------------------------
@@ -52,7 +132,8 @@ async def control_loop():
                 await car.ble_client.write_gatt_char(
                     CONTROL_CHAR_UUID, bytes(car.control), response=False
                 )
-            except Exception:
+            except Exception as exc:
+                log.warning("BLE write failed, disconnecting: %s", exc)
                 car.connected = False
                 car.ble_client = None
                 car.name = ""
@@ -68,7 +149,17 @@ async def control_loop():
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(control_loop())
     print(f"🚗 Backend server listening on port {PORT}")
-    print(f"📷 Pi camera expected at {GO2RTC_BASE}")
+    if USE_LAPTOP_CAMERA:
+        try:
+            laptop_camera.start()
+            print(
+                f"📷 Using laptop camera (index={LAPTOP_CAMERA_INDEX}, "
+                f"{LAPTOP_CAMERA_WIDTH}x{LAPTOP_CAMERA_HEIGHT} @ {LAPTOP_CAMERA_FPS}fps)"
+            )
+        except Exception as e:
+            print(f"📷 Laptop camera failed to start: {e}")
+    else:
+        print(f"📷 Pi camera expected at {GO2RTC_BASE}")
     yield
     task.cancel()
     if car.ble_client and car.connected:
@@ -76,12 +167,21 @@ async def lifespan(app: FastAPI):
             await car.ble_client.disconnect()
         except Exception:
             pass
+    if USE_LAPTOP_CAMERA:
+        laptop_camera.stop()
 
 
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -186,12 +286,16 @@ class ControlInput(BaseModel):
     donut: int = 0
 
 
+_ctrl_log_count = 0
+
 @app.post("/car/control")
 async def car_control(inp: ControlInput):
     """
     Update the control state. The server continuously sends this state
     to the car at 20 Hz — no need to poll or repeat from the client.
     """
+    global _ctrl_log_count
+
     if not car.connected:
         return JSONResponse({"error": "No car connected"}, status_code=409)
 
@@ -202,6 +306,19 @@ async def car_control(inp: ControlInput):
     car.control[5] = 1 if inp.lights else 0
     car.control[6] = 1 if inp.turbo else 0
     car.control[7] = 1 if inp.donut else 0
+
+    _ctrl_log_count += 1
+    has_input = any([inp.forward, inp.reverse, inp.left, inp.right,
+                     inp.lights, inp.turbo, inp.donut])
+    if _ctrl_log_count % 40 == 1 or has_input:
+        log.info(
+            "/car/control #%d  fwd=%d rev=%d L=%d R=%d  "
+            "lights=%d turbo=%d donut=%d  ble_bytes=%s",
+            _ctrl_log_count,
+            inp.forward, inp.reverse, inp.left, inp.right,
+            inp.lights, inp.turbo, inp.donut,
+            list(car.control),
+        )
 
     return {
         "ok": True,
@@ -231,9 +348,41 @@ async def car_status():
 # ===========================  CAMERA ENDPOINTS  ===========================
 
 
+@app.get("/camera/info")
+async def camera_info():
+    """Return camera source details so clients can connect directly."""
+    if USE_LAPTOP_CAMERA:
+        return {
+            "source": "laptop",
+            "stream_url": None,
+            "snapshot_url": None,
+        }
+    return {
+        "source": "pi",
+        "pi_ip": PI_IP,
+        "go2rtc_port": GO2RTC_PORT,
+        "stream_url": f"http://{PI_IP}:{GO2RTC_PORT}/api/stream.mp4?src=camera",
+        "snapshot_url": f"http://{PI_IP}:{GO2RTC_PORT}/api/frame.jpeg?src=camera",
+        "mjpeg_url": f"http://{PI_IP}:{GO2RTC_PORT}/api/stream.mjpeg?src=camera",
+    }
+
+
 @app.post("/camera/connect")
 async def camera_connect():
-    """Check if the Raspberry Pi's go2rtc is reachable."""
+    """Check camera source reachability."""
+    if USE_LAPTOP_CAMERA:
+        if laptop_camera.is_ready():
+            return {
+                "connected": True,
+                "source": "laptop_camera",
+                "camera_index": LAPTOP_CAMERA_INDEX,
+            }
+        return JSONResponse(
+            {"error": "Laptop camera mode enabled, but camera is not ready."},
+            status_code=503,
+        )
+
+    # Default mode: check whether the Raspberry Pi go2rtc endpoint is reachable.
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(f"{GO2RTC_BASE}/api")
@@ -248,8 +397,33 @@ async def camera_connect():
 
 @app.get("/camera/stream")
 async def camera_stream():
-    """Proxy the MJPEG stream from go2rtc on the Pi."""
-    url = f"{GO2RTC_BASE}/api/stream.mjpeg?src=camera"
+    if USE_LAPTOP_CAMERA:
+        # Test mode: serve MJPEG directly from the local webcam.
+        if not laptop_camera.is_ready():
+            return JSONResponse(
+                {"error": "Laptop camera mode enabled, but camera is not ready."},
+                status_code=503,
+            )
+
+        async def generate_mjpeg():
+            while True:
+                frame = laptop_camera.read_jpeg()
+                if frame:
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n\r\n"
+                        + frame
+                        + b"\r\n"
+                    )
+                await asyncio.sleep(1.0 / LAPTOP_CAMERA_FPS)
+
+        return StreamingResponse(
+            generate_mjpeg(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+        )
+
+    # Default mode: proxy the MP4 stream from go2rtc on the Pi.
+    url = f"{GO2RTC_BASE}/api/stream.mp4?src=camera"
 
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10, read=None, write=None, pool=None)
@@ -257,9 +431,7 @@ async def camera_stream():
     try:
         req = client.build_request("GET", url)
         resp = await client.send(req, stream=True)
-        content_type = resp.headers.get(
-            "content-type", "multipart/x-mixed-replace; boundary=frame"
-        )
+        content_type = resp.headers.get("content-type", "video/mp4")
     except Exception:
         await client.aclose()
         return JSONResponse(
@@ -278,9 +450,54 @@ async def camera_stream():
     return StreamingResponse(generate(), media_type=content_type)
 
 
+@app.get("/camera/stream.mjpeg")
+async def camera_stream_mjpeg():
+    """Proxy the MJPEG stream from go2rtc (or serve laptop MJPEG)."""
+    if USE_LAPTOP_CAMERA:
+        return await camera_stream()
+
+    url = f"{GO2RTC_BASE}/api/stream.mjpeg?src=camera"
+
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10, read=None, write=None, pool=None)
+    )
+    try:
+        req = client.build_request("GET", url)
+        resp = await client.send(req, stream=True)
+        content_type = resp.headers.get(
+            "content-type", "multipart/x-mixed-replace; boundary=frame"
+        )
+    except Exception:
+        await client.aclose()
+        return JSONResponse(
+            {"error": f"Cannot connect to MJPEG stream at {url}"},
+            status_code=503,
+        )
+
+    async def generate():
+        try:
+            async for chunk in resp.aiter_bytes(chunk_size=4096):
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(generate(), media_type=content_type)
+
+
 @app.get("/camera/snapshot")
 async def camera_snapshot():
-    """Get a single JPEG frame from go2rtc."""
+    if USE_LAPTOP_CAMERA:
+        # Test mode: return one JPEG frame from the local webcam.
+        frame = laptop_camera.read_jpeg()
+        if frame is None:
+            return JSONResponse(
+                {"error": "Unable to read frame from laptop camera"},
+                status_code=503,
+            )
+        return Response(content=frame, media_type="image/jpeg")
+
+    # Default mode: return a single JPEG frame from go2rtc.
     url = f"{GO2RTC_BASE}/api/frame.jpeg?src=camera"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -314,4 +531,9 @@ async def serve_frontend(full_path: str):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(name)-10s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)
